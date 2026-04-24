@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pandas as pd
@@ -110,6 +111,48 @@ def _initial_dataframe_from_state(state: AgentState) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _extract_referenced_columns(action: str) -> list[str]:
+    """Extract column names referenced as df['column'] in pandas actions."""
+    if not action:
+        return []
+    return re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]", action)
+
+
+def _select_execution_dataframe(
+    action: str,
+    working_df: pd.DataFrame,
+    source_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Choose working data, falling back to source data for missing referenced columns."""
+    if source_df.empty:
+        return working_df
+
+    referenced = _extract_referenced_columns(action)
+    if not referenced:
+        return working_df
+
+    working_columns = {str(col).lower() for col in working_df.columns}
+    source_columns = {str(col).lower() for col in source_df.columns}
+
+    missing_in_working = [
+        column for column in referenced if column.lower() not in working_columns
+    ]
+    if not missing_in_working:
+        return working_df
+
+    if all(column.lower() in source_columns for column in missing_in_working):
+        return source_df
+
+    return working_df
+
+
+def _series_to_step_dataframe(series: pd.Series) -> pd.DataFrame:
+    """Convert a pandas Series into a one-row DataFrame for safe step chaining."""
+    one_row = series.to_frame().T
+    one_row.columns = [str(col) for col in one_row.columns]
+    return one_row.reset_index(drop=True)
+
+
 def executor_node(state: AgentState) -> AgentState:
     """Execute planner steps in order without using an LLM."""
     plan_steps = _normalize_plan_steps(state.get("plan", []))
@@ -121,7 +164,8 @@ def executor_node(state: AgentState) -> AgentState:
             "final_result": "No valid plan steps were provided.",
         }
 
-    working_df = _initial_dataframe_from_state(state)
+    source_df = _initial_dataframe_from_state(state)
+    working_df = source_df.copy(deep=True)
     step_results: list[dict[str, Any]] = []
 
     for index, step in enumerate(plan_steps, start=1):
@@ -134,14 +178,16 @@ def executor_node(state: AgentState) -> AgentState:
                 sql_query = action if action else "SELECT 1 AS ok"
                 sql_result = query_postgres(sql_query)
                 working_df = sql_result.copy(deep=True)
+                source_df = sql_result.copy(deep=True)
                 result: Any = sql_result
             elif tool == "pandas":
                 pandas_code = action if action else "result = df"
-                pandas_result = run_pandas_code(pandas_code, working_df)
+                execution_df = _select_execution_dataframe(action, working_df, source_df)
+                pandas_result = run_pandas_code(pandas_code, execution_df)
                 if isinstance(pandas_result, pd.DataFrame):
                     working_df = pandas_result.copy(deep=True)
                 elif isinstance(pandas_result, pd.Series):
-                    working_df = pandas_result.to_frame()
+                    working_df = _series_to_step_dataframe(pandas_result)
                 result = pandas_result
             elif tool == "visualization":
                 result = generate_plot(working_df, action, step_index=index)

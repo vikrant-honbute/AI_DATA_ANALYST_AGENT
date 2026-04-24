@@ -135,13 +135,13 @@ def _render_step_payload(result: Any) -> None:
         st.info("No result payload for this step.")
 
 
-def _collect_chart_paths(intermediate_results: Any) -> list[dict[str, str]]:
-    """Collect plot files from intermediate step results."""
+def _collect_chart_paths(intermediate_results: Any) -> list[dict[str, Any]]:
+    """Collect plot files and metadata from intermediate step results."""
     if not isinstance(intermediate_results, list):
         return []
 
-    charts: list[dict[str, str]] = []
-    for item in intermediate_results:
+    charts: list[dict[str, Any]] = []
+    for step_number, item in enumerate(intermediate_results, start=1):
         if not isinstance(item, dict):
             continue
 
@@ -163,15 +163,142 @@ def _collect_chart_paths(intermediate_results: Any) -> list[dict[str, str]]:
         if not chart_path.exists():
             continue
 
+        raw_chart_type = result.get("chart_type")
+        chart_type = (
+            raw_chart_type.strip().lower()
+            if isinstance(raw_chart_type, str) and raw_chart_type.strip()
+            else "unknown"
+        )
+
+        raw_rows = result.get("rows")
+        row_count = int(raw_rows) if isinstance(raw_rows, int) else 0
+
+        raw_columns = result.get("columns")
+        columns = [str(col) for col in raw_columns] if isinstance(raw_columns, list) else []
+
         charts.append(
             {
+                "step_number": step_number,
                 "step": str(item.get("step", "")),
                 "tool": str(item.get("tool", "")),
+                "action": str(item.get("action", "")).strip(),
                 "path": str(chart_path),
+                "chart_type": chart_type,
+                "rows": row_count,
+                "columns": columns,
             }
         )
 
     return charts
+
+
+def _result_to_dataframe(result: Any) -> pd.DataFrame | None:
+    """Convert step result payload into a DataFrame when possible."""
+    if isinstance(result, pd.DataFrame):
+        return result.copy(deep=True)
+
+    if isinstance(result, pd.Series):
+        return result.to_frame().T.reset_index(drop=True)
+
+    return None
+
+
+def _find_chart_source_dataframe(
+    step_results: list[dict[str, Any]],
+    chart_step_number: int,
+) -> pd.DataFrame | None:
+    """Find the most recent tabular result before the chart step."""
+    if chart_step_number <= 1:
+        return None
+
+    for index in range(chart_step_number - 2, -1, -1):
+        item = step_results[index]
+        if not isinstance(item, dict):
+            continue
+
+        if isinstance(item.get("error"), str):
+            continue
+
+        dataframe = _result_to_dataframe(item.get("result"))
+        if isinstance(dataframe, pd.DataFrame) and not dataframe.empty:
+            return dataframe
+
+    return None
+
+
+def _pick_date_like_column(df: pd.DataFrame) -> str | None:
+    """Pick a likely date/time column name for contextual chart explanations."""
+    for column in df.columns:
+        lowered = str(column).lower()
+        if any(token in lowered for token in ["date", "time", "month", "day", "year"]):
+            return str(column)
+    return None
+
+
+def _format_number(value: float) -> str:
+    """Format numeric values for concise UI display."""
+    if pd.isna(value):
+        return "n/a"
+
+    if float(value).is_integer():
+        return f"{int(value):,}"
+
+    return f"{float(value):,.2f}"
+
+
+def _build_chart_explanation(
+    chart: dict[str, Any],
+    source_df: pd.DataFrame | None,
+) -> str:
+    """Build deterministic chart-side explanation text."""
+    lines: list[str] = []
+
+    chart_type = str(chart.get("chart_type", "unknown")).title()
+    rows = int(chart.get("rows", 0)) if isinstance(chart.get("rows"), int) else 0
+    columns = chart.get("columns", [])
+    action = str(chart.get("action", "")).strip()
+
+    if action:
+        lines.append(f"- Intent: {action}")
+
+    if rows > 0:
+        lines.append(f"- Chart type: {chart_type} built from {rows} rows.")
+    else:
+        lines.append(f"- Chart type: {chart_type}.")
+
+    if isinstance(columns, list) and columns:
+        shown_columns = ", ".join(str(col) for col in columns[:6])
+        lines.append(f"- Columns used: {shown_columns}")
+
+    if isinstance(source_df, pd.DataFrame) and not source_df.empty:
+        numeric_cols = list(source_df.select_dtypes(include="number").columns)
+        if numeric_cols:
+            metric_col = str(numeric_cols[0])
+            metric_series = pd.to_numeric(source_df[metric_col], errors="coerce").dropna()
+            if not metric_series.empty:
+                max_idx = metric_series.idxmax()
+                min_value = float(metric_series.min())
+                max_value = float(metric_series.max())
+                avg_value = float(metric_series.mean())
+
+                lines.append(
+                    "- Primary metric "
+                    f"{metric_col}: max {_format_number(max_value)}, "
+                    f"min {_format_number(min_value)}, "
+                    f"avg {_format_number(avg_value)}."
+                )
+
+                date_col = _pick_date_like_column(source_df)
+                if date_col is not None and max_idx in source_df.index:
+                    peak_point = source_df.loc[max_idx, date_col]
+                    lines.append(
+                        f"- Peak {metric_col} occurs at {date_col} = {peak_point}."
+                    )
+
+    if len(lines) == 2:
+        lines.append("- Add a comparison query to generate deeper trend insights.")
+
+    return "\n".join(lines)
 
 
 def _json_safe(value: Any) -> Any:
@@ -326,11 +453,23 @@ def main() -> None:
 
     with tab_charts:
         if chart_entries:
-            chart_columns = st.columns(2)
-            for index, chart in enumerate(chart_entries):
-                with chart_columns[index % 2]:
-                    caption = f"{chart['step']} ({chart['tool']})"
-                    st.image(chart["path"], caption=caption, use_container_width=True)
+            for chart in chart_entries:
+                step_name = str(chart.get("step", "Chart step")).strip() or "Chart step"
+                tool_name = str(chart.get("tool", "visualization")).strip() or "visualization"
+                st.markdown(f"### {step_name} ({tool_name})")
+
+                chart_col, explain_col = st.columns([2, 1])
+
+                with chart_col:
+                    st.image(str(chart.get("path", "")), use_container_width=True)
+
+                with explain_col:
+                    st.markdown("#### Chart Explanation")
+                    chart_step_number = int(chart.get("step_number", 0))
+                    source_df = _find_chart_source_dataframe(step_results, chart_step_number)
+                    st.markdown(_build_chart_explanation(chart, source_df))
+
+                st.divider()
         else:
             st.info("No charts generated for this run.")
 
