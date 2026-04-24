@@ -11,6 +11,10 @@ from graph.state import AgentState
 from tools import generate_plot, query_postgres, run_pandas_code
 
 
+_PREVIEW_ROW_LIMIT = 8
+_TEXT_CHAR_LIMIT = 1200
+
+
 def _normalize_plan_steps(raw_plan: Any) -> list[dict[str, str]]:
     """Convert untyped plan input into a normalized step list."""
     if not isinstance(raw_plan, list):
@@ -44,15 +48,32 @@ def _result_to_text(result: Any) -> str:
     if isinstance(result, pd.DataFrame):
         if result.empty:
             return "Empty DataFrame"
-        return result.to_string(index=False)
+        preview = result.head(_PREVIEW_ROW_LIMIT).to_string(index=False)
+        remaining = max(len(result) - _PREVIEW_ROW_LIMIT, 0)
+        remaining_text = f"\n... (+{remaining} more rows)" if remaining else ""
+        column_list = ", ".join(str(col) for col in result.columns)
+        return (
+            f"DataFrame[{len(result)} rows x {len(result.columns)} columns]\n"
+            f"Columns: {column_list}\n"
+            f"Preview:\n{preview}{remaining_text}"
+        )
 
     if isinstance(result, pd.Series):
-        return result.to_string()
+        preview = result.head(_PREVIEW_ROW_LIMIT).to_string()
+        remaining = max(len(result) - _PREVIEW_ROW_LIMIT, 0)
+        remaining_text = f"\n... (+{remaining} more items)" if remaining else ""
+        return f"Series[{len(result)} items]\n{preview}{remaining_text}"
 
     if isinstance(result, (dict, list, tuple)):
-        return json.dumps(result, default=str, ensure_ascii=True)
+        serialized = json.dumps(result, default=str, ensure_ascii=True)
+        if len(serialized) <= _TEXT_CHAR_LIMIT:
+            return serialized
+        return serialized[:_TEXT_CHAR_LIMIT].rstrip() + "..."
 
-    return str(result)
+    text_value = str(result)
+    if len(text_value) <= _TEXT_CHAR_LIMIT:
+        return text_value
+    return text_value[:_TEXT_CHAR_LIMIT].rstrip() + "..."
 
 
 def _build_final_result(step_results: list[dict[str, Any]]) -> str:
@@ -61,6 +82,7 @@ def _build_final_result(step_results: list[dict[str, Any]]) -> str:
         return "No steps were executed."
 
     lines: list[str] = []
+    previous_payload = ""
     for index, item in enumerate(step_results, start=1):
         lines.append(f"Step {index}: {item.get('step', 'Unnamed step')}")
         lines.append(f"Tool: {item.get('tool', 'unknown')}")
@@ -68,7 +90,12 @@ def _build_final_result(step_results: list[dict[str, Any]]) -> str:
         if "error" in item:
             lines.append(f"Error: {item['error']}")
         else:
-            lines.append(_result_to_text(item.get("result")))
+            payload = _result_to_text(item.get("result"))
+            if payload == previous_payload:
+                lines.append("Result: Same as previous step output.")
+            else:
+                lines.append(payload)
+            previous_payload = payload
 
         lines.append("")
 

@@ -3,7 +3,14 @@ Given the final analysis result, generate:
 1) Key insights
 2) Business meaning
 
-Return plain text in this format:
+Rules:
+- Be concise and avoid repeating the same fact with different wording.
+- Use only evidence visible in the final result.
+- Prefer concrete numbers and entities (customer, product, date, value).
+- If evidence is insufficient for a claim, state that explicitly.
+- Keep output short: maximum 4 bullets under Key Insights and maximum 3 bullets under Business Meaning.
+
+Return plain text in this exact format:
 Key Insights:
 - insight 1
 - insight 2
