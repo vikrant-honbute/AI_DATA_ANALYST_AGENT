@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+
+# IDE
+.vscode/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Runtime outputs
+*.png
+project/plots/*.png
+project/project/plots/*.png

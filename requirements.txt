@@ -1,0 +1,13 @@
+langgraph
+langchain
+langchain-core
+langchain-groq
+groq
+pydantic
+pandas
+matplotlib
+SQLAlchemy
+psycopg2-binary
+pymongo
+python-dotenv
+streamlit
