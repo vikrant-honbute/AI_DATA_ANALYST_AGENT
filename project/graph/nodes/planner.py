@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
 import re
+
 from typing import Any, Literal
 
 from langchain_core.output_parsers import PydanticOutputParser
@@ -16,6 +18,8 @@ from llm import get_llm
 from prompts import render_prompt
 from tools.memory_tool import get_recent_memory
 from tools.sql_tool import fetch_postgres_schema
+
+logger = logging.getLogger(__name__)
 
 
 class PlannerStepModel(BaseModel):
@@ -166,7 +170,12 @@ def _normalize_memory_item(item: dict[str, Any], result_char_limit: int = 300) -
 
     try:
         result_text = json.dumps(result_obj, ensure_ascii=True, default=str)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "planner[_normalize_memory_item] failed to JSON-serialize a memory result; "
+            "falling back to str(): %s",
+            exc,
+        )
         result_text = str(result_obj)
 
     if len(result_text) > result_char_limit:
@@ -182,7 +191,12 @@ def _fetch_recent_memory(limit: int = 5) -> list[dict[str, Any]]:
     """Fetch recent memory records from MongoDB with safe fallback."""
     try:
         return get_recent_memory(limit=limit)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "planner[_fetch_recent_memory] failed to fetch recent memory; "
+            "proceeding without memory context: %s",
+            exc,
+        )
         return []
 
 

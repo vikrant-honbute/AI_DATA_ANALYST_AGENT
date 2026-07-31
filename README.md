@@ -5,7 +5,7 @@ A professional LangGraph-based AI data analysis agent with deterministic executi
 ## Stack
 
 - LangGraph: orchestration and conditional retry flow
-- Groq + LangChain: planner/critic/insight LLM nodes
+- Groq + LangChain: planner/critic/insight LLM nodes using openai/gpt-oss-20b by default and openai/gpt-oss-120b for larger runs
 - Pandas: dataframe analysis and chart generation
 - PostgreSQL + SQLAlchemy: structured read-only analysis
 - MongoDB + PyMongo: lightweight memory store

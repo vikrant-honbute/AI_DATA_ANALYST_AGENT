@@ -7,14 +7,13 @@ from langchain_groq import ChatGroq
 from config import Settings, get_settings
 
 GroqModel = Literal[
-    "llama-3.1-8b-instant",
-    "llama3-70b-8192",
-    "mixtral-8x7b-32768",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
 ]
 
 
-def get_llm(model: GroqModel = "llama-3.1-8b-instant") -> ChatGroq:
-    """Return a configured Groq chat model."""
+def get_llm(model: GroqModel = "openai/gpt-oss-20b") -> ChatGroq:
+    """Return a configured Groq chat model, defaulting to openai/gpt-oss-20b."""
     settings: Settings = get_settings()
     if not settings.groq_api_key:
         raise ValueError("GROQ_API_KEY is required for Groq LLM initialization.")

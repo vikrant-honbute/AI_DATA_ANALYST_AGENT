@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from uuid import uuid4
 from typing import Any
 
 import pandas as pd
@@ -156,10 +157,14 @@ def _series_to_step_dataframe(series: pd.Series) -> pd.DataFrame:
 def executor_node(state: AgentState) -> AgentState:
     """Execute planner steps in order without using an LLM."""
     plan_steps = _normalize_plan_steps(state.get("plan", []))
+    run_id = state.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        run_id = uuid4().hex
 
     if not plan_steps:
         return {
             **state,
+            "run_id": run_id,
             "intermediate_results": [],
             "final_result": "No valid plan steps were provided.",
         }
@@ -190,7 +195,7 @@ def executor_node(state: AgentState) -> AgentState:
                     working_df = _series_to_step_dataframe(pandas_result)
                 result = pandas_result
             elif tool == "visualization":
-                result = generate_plot(working_df, action, step_index=index)
+                result = generate_plot(working_df, action, step_index=index, run_id=run_id)
             else:
                 raise ValueError(f"Unsupported tool '{tool}'.")
 
@@ -214,6 +219,7 @@ def executor_node(state: AgentState) -> AgentState:
 
     return {
         **state,
+        "run_id": run_id,
         "intermediate_results": step_results,
         "final_result": _build_final_result(step_results),
     }

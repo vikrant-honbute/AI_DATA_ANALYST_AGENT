@@ -250,55 +250,128 @@ def _build_chart_explanation(
     chart: dict[str, Any],
     source_df: pd.DataFrame | None,
 ) -> str:
-    """Build deterministic chart-side explanation text."""
+    """Build chart-type-specific explanation text with advanced insights."""
     lines: list[str] = []
 
-    chart_type = str(chart.get("chart_type", "unknown")).title()
+    chart_type = str(chart.get("chart_type", "unknown")).lower()
     rows = int(chart.get("rows", 0)) if isinstance(chart.get("rows"), int) else 0
     columns = chart.get("columns", [])
     action = str(chart.get("action", "")).strip()
 
     if action:
-        lines.append(f"- Intent: {action}")
+        lines.append(f"**Intent:** {action}")
 
     if rows > 0:
-        lines.append(f"- Chart type: {chart_type} built from {rows} rows.")
-    else:
-        lines.append(f"- Chart type: {chart_type}.")
-
-    if isinstance(columns, list) and columns:
-        shown_columns = ", ".join(str(col) for col in columns[:6])
-        lines.append(f"- Columns used: {shown_columns}")
+        lines.append(f"**Data:** {rows} rows, {len(columns)} columns")
 
     if isinstance(source_df, pd.DataFrame) and not source_df.empty:
         numeric_cols = list(source_df.select_dtypes(include="number").columns)
-        if numeric_cols:
-            metric_col = str(numeric_cols[0])
-            metric_series = pd.to_numeric(source_df[metric_col], errors="coerce").dropna()
-            if not metric_series.empty:
-                max_idx = metric_series.idxmax()
-                min_value = float(metric_series.min())
-                max_value = float(metric_series.max())
-                avg_value = float(metric_series.mean())
+        categorical_cols = [c for c in source_df.columns if c not in numeric_cols]
 
-                lines.append(
-                    "- Primary metric "
-                    f"{metric_col}: max {_format_number(max_value)}, "
-                    f"min {_format_number(min_value)}, "
-                    f"avg {_format_number(avg_value)}."
-                )
+        if chart_type == "scatter":
+            if len(numeric_cols) >= 2:
+                lines.append(f"**Relationship:** Shows correlation between {numeric_cols[0]} and {numeric_cols[1]}")
+                corr = source_df[numeric_cols[0]].corr(source_df[numeric_cols[1]])
+                lines.append(f"**Correlation:** {corr:.3f}")
 
-                date_col = _pick_date_like_column(source_df)
-                if date_col is not None and max_idx in source_df.index:
-                    peak_point = source_df.loc[max_idx, date_col]
-                    lines.append(
-                        f"- Peak {metric_col} occurs at {date_col} = {peak_point}."
-                    )
+        elif chart_type == "bubble":
+            if len(numeric_cols) >= 3:
+                lines.append(f"**3D Relationship:** {numeric_cols[0]} vs {numeric_cols[1]}, sized by {numeric_cols[2]}")
+                
+        elif chart_type in ["box", "boxplot"]:
+            if numeric_cols:
+                metric = numeric_cols[0]
+                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
+                if not metric_series.empty:
+                    q1 = metric_series.quantile(0.25)
+                    q3 = metric_series.quantile(0.75)
+                    iqr = q3 - q1
+                    outliers = metric_series[(metric_series < q1 - 1.5*iqr) | (metric_series > q3 + 1.5*iqr)]
+                    lines.append(f"**Distribution:** Q1={_format_number(q1)}, Q3={_format_number(q3)}")
+                    lines.append(f"**Outliers:** {len(outliers)} detected")
 
-    if len(lines) == 2:
-        lines.append("- Add a comparison query to generate deeper trend insights.")
+        elif chart_type == "violin":
+            if numeric_cols:
+                lines.append(f"**Distribution Shape:** {numeric_cols[0]} density visualization")
+
+        elif chart_type == "heatmap":
+            lines.append("**Correlation Matrix:** Shows relationships between numeric variables")
+            if numeric_cols:
+                lines.append(f"**Variables:** {', '.join(numeric_cols[:5])}")
+
+        elif chart_type == "area":
+            if numeric_cols:
+                lines.append(f"**Trend Stacking:** Multiple series over {len(source_df)} time periods")
+
+        elif chart_type == "pie":
+            if categorical_cols and numeric_cols:
+                lines.append(f"**Breakdown:** {categorical_cols[0]} proportions by {numeric_cols[0]}")
+            elif numeric_cols:
+                metric = numeric_cols[0]
+                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
+                if not metric_series.empty:
+                    lines.append(f"**Total:** {_format_number(metric_series.sum())}")
+
+        elif chart_type == "kde":
+            if numeric_cols:
+                metric = numeric_cols[0]
+                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
+                if not metric_series.empty:
+                    mean_val = float(metric_series.mean())
+                    std_val = float(metric_series.std())
+                    lines.append(f"**Distribution:** {metric} (mean={_format_number(mean_val)}, σ={_format_number(std_val)})")
+
+        elif chart_type == "hist":
+            if numeric_cols:
+                metric = numeric_cols[0]
+                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
+                if not metric_series.empty:
+                    lines.append(f"**Range:** {_format_number(metric_series.min())} to {_format_number(metric_series.max())}")
+                    mode_val = metric_series.mode()[0] if len(metric_series.mode()) > 0 else metric_series.mean()
+                    lines.append(f"**Mode:** {_format_number(mode_val)}")
+
+        elif chart_type == "bar":
+            if categorical_cols and numeric_cols:
+                lines.append(f"**Comparison:** {categorical_cols[0]} values by {numeric_cols[0]}")
+            elif numeric_cols:
+                metric = numeric_cols[0]
+                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
+                if not metric_series.empty:
+                    lines.append(f"**Total:** {_format_number(metric_series.sum())}")
+
+        else:  # line chart
+            if numeric_cols:
+                metric = numeric_cols[0]
+                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
+                if not metric_series.empty:
+                    trend = "📈 Rising" if metric_series.iloc[-1] > metric_series.iloc[0] else "📉 Falling"
+                    lines.append(f"**Trend:** {trend}")
+                    lines.append(f"**Range:** {_format_number(metric_series.min())} to {_format_number(metric_series.max())}")
+
+    if not lines:
+        lines.append("- No detailed insights available for this visualization.")
 
     return "\n".join(lines)
+
+
+_CSV_ENCODING_FALLBACKS = ("utf-8", "utf-8-sig", "gb18030", "cp1252", "latin-1")
+
+
+def _read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
+    """Read an uploaded CSV, retrying with common encodings when UTF-8 fails."""
+    last_error: Exception | None = None
+
+    for encoding in _CSV_ENCODING_FALLBACKS:
+        try:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, encoding=encoding)
+        except (UnicodeDecodeError, pd.errors.ParserError) as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+
+    return pd.read_csv(uploaded_file)
 
 
 def _json_safe(value: Any) -> Any:
@@ -346,7 +419,7 @@ def main() -> None:
 
     if uploaded_file is not None:
         try:
-            uploaded_df = pd.read_csv(uploaded_file)
+            uploaded_df = _read_uploaded_csv(uploaded_file)
             st.success(
                 f"Loaded {uploaded_file.name}: {len(uploaded_df)} rows x {len(uploaded_df.columns)} columns"
             )

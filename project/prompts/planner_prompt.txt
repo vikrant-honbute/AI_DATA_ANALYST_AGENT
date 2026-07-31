@@ -35,6 +35,22 @@ Rules:
 - If use_memory_context is true and memory context is available, include an early step that reuses memory for comparison/reference.
 - Memory-reuse steps must remain executable using allowed tools.
 
+Chart Type Guidance (use diverse visualizations):
+- scatter/bubble: For comparing 2+ numeric variables or identifying relationships.
+- box/violin: For distribution analysis or detecting outliers in numeric data.
+- heatmap: For correlation matrices or 2D intensity patterns.
+- area: For multi-series trends over time or cumulative totals.
+- pie: For categorical breakdowns with few categories (< 6 segments).
+- kde: For smooth distribution visualization of continuous data.
+- bar: For categorical comparisons or frequency counts.
+- line: For time-series or trend analysis.
+- hist: For distribution of a single numeric variable.
+- If action suggests "show trend" → use line or area.
+- If action suggests "compare" → use bar or scatter.
+- If action suggests "distribution" → use box, violin, or kde.
+- If action suggests "proportion" → use pie.
+- If action suggests "correlation" → use heatmap.
+
 Use this exact schema:
 {"steps":[{"step":"description","tool":"sql | pandas | visualization","action":"what to do"}],"data_source":"postgres | csv | mongo","final_output":"table | chart | summary"}
 

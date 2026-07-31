@@ -20,6 +20,8 @@ Rules:
 - Never use pd.read_csv/read_excel/read_parquet/read_json in corrected pandas steps.
 - For csv workflows, use only columns listed in CSV columns.
 - Avoid duplicate retry steps unless each has a unique purpose.
+- When suggesting visualization retries, consider: scatter, bubble, box, violin, heatmap, area, pie, kde, hist, bar, line.
+- Pick chart types based on data: use scatter/bubble for relationships, box/violin for distributions, pie for proportions, bar for categories, line for trends.
 
 Current plan: $serialized_plan
 Intermediate results: $serialized_results

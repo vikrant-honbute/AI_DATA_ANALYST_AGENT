@@ -6,6 +6,7 @@ from langgraph.graph import END, START, StateGraph
 
 from graph.nodes import critic_node, executor_node, insight_node, planner_node
 from graph.state import AgentState
+from tools.pandas_tool import cleanup_plot_files
 
 
 MAX_RETRIES = 2
@@ -26,6 +27,7 @@ def build_workflow():
 	critic (retry=True) -> executor
 	critic (retry=False) -> insight -> END
 	"""
+	cleanup_plot_files()
 	graph = StateGraph(AgentState)
 
 	graph.add_node("planner", planner_node)
