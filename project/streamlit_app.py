@@ -226,13 +226,40 @@ def _find_chart_source_dataframe(
     return None
 
 
-def _pick_date_like_column(df: pd.DataFrame) -> str | None:
-    """Pick a likely date/time column name for contextual chart explanations."""
-    for column in df.columns:
-        lowered = str(column).lower()
-        if any(token in lowered for token in ["date", "time", "month", "day", "year"]):
-            return str(column)
-    return None
+def _prettify_name(name: str) -> str:
+    """Convert a column/step name into a readable title ('total_profit' -> 'Total Profit')."""
+    text = re.sub(r"[\-_]+", " ", str(name))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return text
+    return text[:1].upper() + text[1:]
+
+
+def _looks_like_money(name: str) -> bool:
+    """Return True when a metric name suggests a currency value."""
+    lowered = str(name).lower()
+    tokens = [
+        "revenue", "sales", "profit", "amount", "income", "price",
+        "cost", "spend", "budget", "salary", "fee", "value",
+    ]
+    return any(token in lowered for token in tokens)
+
+
+def _format_compact(value: float) -> str:
+    """Format a number compactly: 108000 -> '108K', 1200000 -> '1.2M'."""
+    if value is None or pd.isna(value):
+        return "—"
+    value = float(value)
+    abs_value = abs(value)
+    if abs_value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f}B"
+    if abs_value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if abs_value >= 1_000:
+        return f"{value / 1_000:.0f}K"
+    if abs_value >= 100:
+        return f"{value:,.0f}"
+    return f"{value:,.2f}"
 
 
 def _format_number(value: float) -> str:
@@ -246,112 +273,499 @@ def _format_number(value: float) -> str:
     return f"{float(value):,.2f}"
 
 
-def _build_chart_explanation(
-    chart: dict[str, Any],
-    source_df: pd.DataFrame | None,
-) -> str:
-    """Build chart-type-specific explanation text with advanced insights."""
-    lines: list[str] = []
+def _html_escape(text: str) -> str:
+    """Escape text for safe embedding in rendered HTML."""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
-    chart_type = str(chart.get("chart_type", "unknown")).lower()
-    rows = int(chart.get("rows", 0)) if isinstance(chart.get("rows"), int) else 0
-    columns = chart.get("columns", [])
-    action = str(chart.get("action", "")).strip()
 
-    if action:
-        lines.append(f"**Intent:** {action}")
+def _analyze_chart_data(chart: dict[str, Any], source_df: pd.DataFrame | None) -> dict[str, Any]:
+    """Compute KPI cards and numeric facts for a chart from its source data."""
+    empty = {"kpis": [], "mode": "none", "metric_label": "", "group_label": ""}
 
-    if rows > 0:
-        lines.append(f"**Data:** {rows} rows, {len(columns)} columns")
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        return empty
 
-    if isinstance(source_df, pd.DataFrame) and not source_df.empty:
-        numeric_cols = list(source_df.select_dtypes(include="number").columns)
-        categorical_cols = [c for c in source_df.columns if c not in numeric_cols]
+    numeric_cols = list(source_df.select_dtypes(include="number").columns)
+    categorical_cols = [c for c in source_df.columns if c not in numeric_cols]
+    chart_type = str(chart.get("chart_type", "")).lower()
+    record_kpi = {
+        "label": "Records",
+        "icon": "📊",
+        "value": f"{len(source_df):,}",
+        "sub": "Total records",
+        "tone": "neutral",
+    }
 
-        if chart_type == "scatter":
-            if len(numeric_cols) >= 2:
-                lines.append(f"**Relationship:** Shows correlation between {numeric_cols[0]} and {numeric_cols[1]}")
-                corr = source_df[numeric_cols[0]].corr(source_df[numeric_cols[1]])
-                lines.append(f"**Correlation:** {corr:.3f}")
+    if chart_type == "scatter" and len(numeric_cols) >= 2:
+        x_col, y_col = numeric_cols[0], numeric_cols[1]
+        x_series = pd.to_numeric(source_df[x_col], errors="coerce")
+        y_series = pd.to_numeric(source_df[y_col], errors="coerce")
+        corr = x_series.corr(y_series)
+        return {
+            "kpis": [
+                {
+                    "label": "Correlation",
+                    "icon": "🔗",
+                    "value": f"{corr:.2f}",
+                    "sub": f"{_prettify_name(x_col)} vs {_prettify_name(y_col)}",
+                    "tone": "info",
+                },
+                {
+                    "label": "Highest Value",
+                    "icon": "🏆",
+                    "value": _format_compact(y_series.max()),
+                    "sub": _prettify_name(y_col),
+                    "tone": "success",
+                },
+                {
+                    "label": "Average Value",
+                    "icon": "📈",
+                    "value": _format_compact(y_series.mean()),
+                    "sub": "Mean",
+                    "tone": "neutral",
+                },
+                record_kpi,
+            ],
+            "mode": "scatter",
+            "metric_label": _prettify_name(y_col),
+            "group_label": _prettify_name(x_col),
+            "best_name": _prettify_name(x_col),
+            "best_value": _format_compact(y_series.max()),
+            "worst_name": _prettify_name(y_col),
+            "worst_value": _format_compact(y_series.min()),
+            "avg_value": _format_compact(y_series.mean()),
+            "trend": "rising" if y_series.iloc[-1] > y_series.iloc[0] else "declining",
+        }
 
-        elif chart_type == "bubble":
-            if len(numeric_cols) >= 3:
-                lines.append(f"**3D Relationship:** {numeric_cols[0]} vs {numeric_cols[1]}, sized by {numeric_cols[2]}")
-                
-        elif chart_type in ["box", "boxplot"]:
-            if numeric_cols:
-                metric = numeric_cols[0]
-                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
-                if not metric_series.empty:
-                    q1 = metric_series.quantile(0.25)
-                    q3 = metric_series.quantile(0.75)
-                    iqr = q3 - q1
-                    outliers = metric_series[(metric_series < q1 - 1.5*iqr) | (metric_series > q3 + 1.5*iqr)]
-                    lines.append(f"**Distribution:** Q1={_format_number(q1)}, Q3={_format_number(q3)}")
-                    lines.append(f"**Outliers:** {len(outliers)} detected")
+    if chart_type in {"line", "area"} and numeric_cols:
+        metric = numeric_cols[0]
+        series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
+        if not series.empty:
+            best_value = float(series.max())
+            worst_value = float(series.min())
+            avg_value = float(series.mean())
+            metric_label = _prettify_name(metric)
+            money_prefix = "$" if _looks_like_money(metric_label) else ""
+            return {
+                "kpis": [
+                    {
+                        "label": "Highest Value",
+                        "icon": "🏆",
+                        "value": f"{money_prefix}{_format_compact(best_value)}",
+                        "sub": "Peak",
+                        "tone": "success",
+                    },
+                    {
+                        "label": "Lowest Value",
+                        "icon": "⚠️",
+                        "value": f"{money_prefix}{_format_compact(worst_value)}",
+                        "sub": "Trough",
+                        "tone": "danger",
+                    },
+                    {
+                        "label": "Average",
+                        "icon": "📈",
+                        "value": f"{money_prefix}{_format_compact(avg_value)}",
+                        "sub": "Mean",
+                        "tone": "neutral",
+                    },
+                    record_kpi,
+                ],
+                "mode": "series",
+                "metric_label": metric_label,
+                "group_label": _prettify_name(categorical_cols[0]) if categorical_cols else "time",
+                "best_name": "Peak",
+                "best_value": best_value,
+                "worst_name": "Trough",
+                "worst_value": worst_value,
+                "avg_value": avg_value,
+                "trend": "rising" if series.iloc[-1] > series.iloc[0] else "declining",
+            }
 
-        elif chart_type == "violin":
-            if numeric_cols:
-                lines.append(f"**Distribution Shape:** {numeric_cols[0]} density visualization")
+    if categorical_cols and numeric_cols:
+        group_col = categorical_cols[0]
+        metric = numeric_cols[0]
+        grouped = (
+            pd.to_numeric(source_df[metric], errors="coerce")
+            .groupby(source_df[group_col].astype(str), sort=False)
+            .sum()
+            .dropna()
+        )
+        if not grouped.empty:
+            best = grouped.idxmax()
+            worst = grouped.idxmin()
+            best_value = float(grouped.max())
+            worst_value = float(grouped.min())
+            total_value = float(grouped.sum())
+            avg_value = float(grouped.mean())
+            best_share = best_value / total_value * 100 if total_value else 0.0
+            metric_label = _prettify_name(metric)
+            money_prefix = "$" if _looks_like_money(metric_label) else ""
 
-        elif chart_type == "heatmap":
-            lines.append("**Correlation Matrix:** Shows relationships between numeric variables")
-            if numeric_cols:
-                lines.append(f"**Variables:** {', '.join(numeric_cols[:5])}")
+            return {
+                "kpis": [
+                    {
+                        "label": "Highest Value",
+                        "icon": "🏆",
+                        "value": f"{money_prefix}{_format_compact(best_value)}",
+                        "sub": best,
+                        "tone": "success",
+                    },
+                    {
+                        "label": "Lowest Value",
+                        "icon": "⚠️",
+                        "value": f"{money_prefix}{_format_compact(worst_value)}",
+                        "sub": worst,
+                        "tone": "danger",
+                    },
+                    {
+                        "label": "Average",
+                        "icon": "📈",
+                        "value": f"{money_prefix}{_format_compact(avg_value)}",
+                        "sub": f"Across {len(grouped)} segments",
+                        "tone": "neutral",
+                    },
+                    record_kpi,
+                ],
+                "mode": "categorical",
+                "metric_label": metric_label,
+                "group_label": _prettify_name(group_col),
+                "best_name": best,
+                "best_value": best_value,
+                "best_share": best_share,
+                "worst_name": worst,
+                "worst_value": worst_value,
+                "avg_value": avg_value,
+                "total_value": total_value,
+                "n_segments": len(grouped),
+            }
 
-        elif chart_type == "area":
-            if numeric_cols:
-                lines.append(f"**Trend Stacking:** Multiple series over {len(source_df)} time periods")
+    if numeric_cols:
+        metric = numeric_cols[0]
+        series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
+        if not series.empty:
+            best_value = float(series.max())
+            worst_value = float(series.min())
+            avg_value = float(series.mean())
+            metric_label = _prettify_name(metric)
+            money_prefix = "$" if _looks_like_money(metric_label) else ""
+            return {
+                "kpis": [
+                    {
+                        "label": "Highest Value",
+                        "icon": "🏆",
+                        "value": f"{money_prefix}{_format_compact(best_value)}",
+                        "sub": "Peak",
+                        "tone": "success",
+                    },
+                    {
+                        "label": "Lowest Value",
+                        "icon": "⚠️",
+                        "value": f"{money_prefix}{_format_compact(worst_value)}",
+                        "sub": "Trough",
+                        "tone": "danger",
+                    },
+                    {
+                        "label": "Average",
+                        "icon": "📈",
+                        "value": f"{money_prefix}{_format_compact(avg_value)}",
+                        "sub": "Mean",
+                        "tone": "neutral",
+                    },
+                    record_kpi,
+                ],
+                "mode": "series",
+                "metric_label": metric_label,
+                "group_label": _prettify_name(categorical_cols[0]) if categorical_cols else "time",
+                "best_name": "Peak",
+                "best_value": best_value,
+                "worst_name": "Trough",
+                "worst_value": worst_value,
+                "avg_value": avg_value,
+                "trend": "rising" if series.iloc[-1] > series.iloc[0] else "declining",
+            }
 
-        elif chart_type == "pie":
-            if categorical_cols and numeric_cols:
-                lines.append(f"**Breakdown:** {categorical_cols[0]} proportions by {numeric_cols[0]}")
-            elif numeric_cols:
-                metric = numeric_cols[0]
-                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
-                if not metric_series.empty:
-                    lines.append(f"**Total:** {_format_number(metric_series.sum())}")
+    if categorical_cols:
+        counts = source_df[categorical_cols[0]].astype(str).value_counts()
+        if not counts.empty:
+            best = counts.idxmax()
+            worst = counts.idxmin()
+            best_value = int(counts.max())
+            worst_value = int(counts.min())
+            return {
+                "kpis": [
+                    {
+                        "label": "Most Frequent",
+                        "icon": "🏆",
+                        "value": f"{best_value:,}",
+                        "sub": best,
+                        "tone": "success",
+                    },
+                    {
+                        "label": "Least Frequent",
+                        "icon": "⚠️",
+                        "value": f"{worst_value:,}",
+                        "sub": worst,
+                        "tone": "danger",
+                    },
+                    {
+                        "label": "Average Frequency",
+                        "icon": "📈",
+                        "value": f"{counts.mean():,.1f}",
+                        "sub": "Per category",
+                        "tone": "neutral",
+                    },
+                    record_kpi,
+                ],
+                "mode": "counts",
+                "metric_label": _prettify_name(categorical_cols[0]),
+                "group_label": _prettify_name(categorical_cols[0]),
+                "best_name": best,
+                "best_value": best_value,
+                "worst_name": worst,
+                "worst_value": worst_value,
+                "avg_value": float(counts.mean()),
+            }
 
-        elif chart_type == "kde":
-            if numeric_cols:
-                metric = numeric_cols[0]
-                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
-                if not metric_series.empty:
-                    mean_val = float(metric_series.mean())
-                    std_val = float(metric_series.std())
-                    lines.append(f"**Distribution:** {metric} (mean={_format_number(mean_val)}, σ={_format_number(std_val)})")
+    return empty
 
-        elif chart_type == "hist":
-            if numeric_cols:
-                metric = numeric_cols[0]
-                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
-                if not metric_series.empty:
-                    lines.append(f"**Range:** {_format_number(metric_series.min())} to {_format_number(metric_series.max())}")
-                    mode_val = metric_series.mode()[0] if len(metric_series.mode()) > 0 else metric_series.mean()
-                    lines.append(f"**Mode:** {_format_number(mode_val)}")
 
-        elif chart_type == "bar":
-            if categorical_cols and numeric_cols:
-                lines.append(f"**Comparison:** {categorical_cols[0]} values by {numeric_cols[0]}")
-            elif numeric_cols:
-                metric = numeric_cols[0]
-                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
-                if not metric_series.empty:
-                    lines.append(f"**Total:** {_format_number(metric_series.sum())}")
+def _chart_title_and_subtitle(chart: dict[str, Any], analysis: dict[str, Any]) -> tuple[str, str]:
+    """Derive a user-facing title and subtitle for a chart."""
+    chart_type = str(chart.get("chart_type", "")).lower()
+    mode = analysis.get("mode", "none")
+    metric = analysis.get("metric_label", "")
+    group = analysis.get("group_label", "")
 
-        else:  # line chart
-            if numeric_cols:
-                metric = numeric_cols[0]
-                metric_series = pd.to_numeric(source_df[metric], errors="coerce").dropna()
-                if not metric_series.empty:
-                    trend = "📈 Rising" if metric_series.iloc[-1] > metric_series.iloc[0] else "📉 Falling"
-                    lines.append(f"**Trend:** {trend}")
-                    lines.append(f"**Range:** {_format_number(metric_series.min())} to {_format_number(metric_series.max())}")
+    if mode == "categorical" and metric and group:
+        title = f"{metric} by {group}"
+        subtitle = f"Comparison of {metric.lower()} across all {group.lower()} segments."
+    elif mode == "scatter" and metric and group:
+        title = f"{group} vs {metric}"
+        subtitle = f"Relationship between {group.lower()} and {metric.lower()}."
+    elif mode == "series" and metric:
+        title = metric
+        subtitle = f"Trend of {metric.lower()} over the analyzed period."
+    elif mode == "counts" and metric:
+        title = f"Distribution of {metric}"
+        subtitle = f"Frequency of each {metric.lower()} category in the dataset."
+    elif metric:
+        title = metric
+        subtitle = "Visual summary of the analyzed metric."
+    else:
+        title = "Data Overview"
+        subtitle = "Visual overview of the analyzed dataset."
 
-    if not lines:
-        lines.append("- No detailed insights available for this visualization.")
+    if chart_type in {"pie", "donut"} and mode == "categorical" and metric and group:
+        subtitle = f"Share of {metric.lower()} contributed by each {group.lower()}."
+    if chart_type in {"hist", "kde", "box", "boxplot", "violin"} and metric:
+        subtitle = f"Distribution of {metric.lower()} across the analyzed data."
 
-    return "\n".join(lines)
+    return title, subtitle
+
+
+def _build_business_insight(chart: dict[str, Any], analysis: dict[str, Any]) -> str:
+    """Compose a senior-business-analyst style narrative from computed facts."""
+    mode = analysis.get("mode", "none")
+    metric = analysis.get("metric_label", "")
+    money_prefix = "$" if _looks_like_money(metric) else ""
+
+    if mode == "categorical":
+        best = analysis["best_name"]
+        worst = analysis["worst_name"]
+        share = analysis.get("best_share", 0.0)
+        n = analysis.get("n_segments", 0)
+        best_v = f"{money_prefix}{_format_compact(analysis['best_value'])}"
+        worst_v = f"{money_prefix}{_format_compact(analysis['worst_value'])}"
+        avg_v = f"{money_prefix}{_format_compact(analysis['avg_value'])}"
+        paragraphs = [
+            f"{best} is the strongest performer, reaching {best_v} — approximately {share:.0f}% of total "
+            f"{metric.lower()}. This makes it the clear growth engine of the portfolio.",
+            f"{worst} trails significantly at {worst_v}, pointing to an opportunity to investigate the drivers "
+            f"behind its underperformance and unlock untapped potential.",
+            f"Across the {n} segments, the average is {avg_v}, providing a solid baseline for setting realistic "
+            f"targets and tracking performance over time.",
+        ]
+        return "\n\n".join(paragraphs)
+
+    if mode == "series":
+        best_v = f"{money_prefix}{_format_compact(analysis['best_value'])}"
+        worst_v = f"{money_prefix}{_format_compact(analysis['worst_value'])}"
+        avg_v = f"{money_prefix}{_format_compact(analysis['avg_value'])}"
+        trend = analysis.get("trend", "stable")
+        paragraphs = [
+            f"The metric peaked at {best_v} and dipped to {worst_v} over the analyzed period.",
+            f"The overall trend shows {'an upward trajectory' if trend == 'rising' else 'a downward trajectory'}, "
+            f"with an average of {avg_v} across all observations.",
+        ]
+        if trend == "rising":
+            paragraphs.append(
+                "Sustaining this momentum should remain a top priority for the coming periods."
+            )
+        else:
+            paragraphs.append(
+                "Reverse engineering the periods of decline will be essential to stabilize performance."
+            )
+        return "\n\n".join(paragraphs)
+
+    if mode == "counts":
+        best = analysis["best_name"]
+        worst = analysis["worst_name"]
+        best_v = f"{analysis['best_value']:,}"
+        worst_v = f"{analysis['worst_value']:,}"
+        avg_v = f"{analysis['avg_value']:,.1f}"
+        paragraphs = [
+            f"'{best}' dominates the dataset with {best_v} occurrences, making it the clear focus of the data.",
+            f"'{worst}' appears only {worst_v} times, suggesting a segment that may be underserved or underexplored.",
+            f"On average, each category appears {avg_v} times, which helps calibrate expectations for future sampling.",
+        ]
+        return "\n\n".join(paragraphs)
+
+    return (
+        "The visualization provides a clear overview of the dataset, highlighting the distribution and "
+        "key patterns across the analyzed fields. No single metric dominates, so decisions should weigh "
+        "multiple dimensions before committing resources."
+    )
+
+
+def _build_recommendations(chart: dict[str, Any], analysis: dict[str, Any]) -> list[str]:
+    """Generate concise, actionable recommendations from the analysis."""
+    mode = analysis.get("mode", "none")
+
+    if mode == "categorical":
+        best = analysis["best_name"]
+        worst = analysis["worst_name"]
+        return [
+            f"Increase investment in {best}, the highest-performing segment.",
+            f"Investigate why {worst} underperforms and build a corrective plan.",
+            f"Replicate the success factors of {best} across other segments.",
+            "Revisit pricing and operations to close the gap between top and bottom performers.",
+        ]
+
+    if mode == "series":
+        if analysis.get("trend") == "rising":
+            return [
+                "Capitalize on the upward trend by scaling the initiatives behind this metric.",
+                "Set stretch targets to lock in the current growth momentum.",
+                "Monitor the metric for early signs of slowdown in the coming periods.",
+            ]
+        return [
+            "Develop a mitigation plan to reverse the downward trend.",
+            "Identify the periods driving the decline and investigate their root causes.",
+            "Introduce a closer monitoring cadence until the metric stabilizes.",
+        ]
+
+    if mode == "counts":
+        best = analysis["best_name"]
+        worst = analysis["worst_name"]
+        return [
+            f"Deep-dive into what drives the popularity of '{best}'.",
+            f"Explore ways to lift engagement with '{worst}'.",
+            "Use segment-level feedback to guide the next iteration of the strategy.",
+        ]
+
+    return [
+        "Focus on the metrics with the highest business impact first.",
+        "Establish a monitoring cadence to track changes over time.",
+    ]
+
+def _render_kpi_cards(kpis: list[dict[str, str]]) -> None:
+    """Render responsive KPI cards with icons and tone-based colors."""
+    if not kpis:
+        return
+
+    cards: list[str] = []
+    for kpi in kpis:
+        tone = str(kpi.get("tone", "neutral"))
+        icon = str(kpi.get("icon", "📊"))
+        label = _html_escape(kpi.get("label", ""))
+        value = _html_escape(kpi.get("value", ""))
+        sub = _html_escape(kpi.get("sub", ""))
+        sub_html = f'<div class="ada-kpi-sub">{sub}</div>' if sub else ""
+        cards.append(
+            f'<div class="ada-kpi-card tone-{tone}">'
+            f'<div class="ada-kpi-icon">{icon}</div>'
+            f'<div class="ada-kpi-body">'
+            f'<div class="ada-kpi-label">{label}</div>'
+            f'<div class="ada-kpi-value tone-{tone}">{value}</div>'
+            f"{sub_html}"
+            f"</div></div>"
+        )
+
+    st.markdown(f'<div class="ada-kpi-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def _render_insight_card(text: str) -> None:
+    """Render the Key Insight card with a business-analyst narrative."""
+    if not text.strip():
+        return
+
+    paragraphs = "".join(
+        f"<p>{_html_escape(paragraph)}</p>" for paragraph in text.split("\n\n") if paragraph.strip()
+    )
+    st.markdown(
+        '<div class="ada-card ada-insight">'
+        '<div class="ada-card-head">'
+        '<span class="ada-card-icon">💡</span>'
+        '<span class="ada-card-title">Key Insight</span>'
+        "</div>"
+        f'<div class="ada-card-body">{paragraphs}</div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_recommendations_card(items: list[str]) -> None:
+    """Render the Recommendations card with concise action items."""
+    if not items:
+        return
+
+    bullets = "".join(f"<li>{_html_escape(item)}</li>" for item in items)
+    st.markdown(
+        '<div class="ada-card ada-reco">'
+        '<div class="ada-card-head">'
+        '<span class="ada-card-icon">🎯</span>'
+        '<span class="ada-card-title">Recommendations</span>'
+        "</div>"
+        f'<div class="ada-card-body"><ul>{bullets}</ul></div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_chart_section(chart: dict[str, Any], step_results: list[dict[str, Any]]) -> None:
+    """Render one complete chart section: title, KPIs, chart, insights, recommendations."""
+    chart_step_number = int(chart.get("step_number", 0))
+    source_df = _find_chart_source_dataframe(step_results, chart_step_number)
+    analysis = _analyze_chart_data(chart, source_df)
+    title, subtitle = _chart_title_and_subtitle(chart, analysis)
+
+    st.markdown(
+        f'<div class="ada-chart-title">{_html_escape(title)}</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="ada-chart-subtitle">{_html_escape(subtitle)}</div>',
+        unsafe_allow_html=True,
+    )
+
+    _render_kpi_cards(analysis.get("kpis", []))
+
+    st.markdown('<div class="ada-chart-frame">', unsafe_allow_html=True)
+    st.image(str(chart.get("path", "")), use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    insight_text = _build_business_insight(chart, analysis)
+    _render_insight_card(insight_text)
+    _render_recommendations_card(_build_recommendations(chart, analysis))
+
+    st.markdown('<hr class="ada-divider"/>', unsafe_allow_html=True)
 
 
 _CSV_ENCODING_FALLBACKS = ("utf-8", "utf-8-sig", "gb18030", "cp1252", "latin-1")
@@ -372,6 +786,258 @@ def _read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
         raise last_error
 
     return pd.read_csv(uploaded_file)
+
+
+_PREMIUM_CSS = """
+<style>
+/* ============================================================
+   AI DATA ANALYST — PREMIUM DARK THEME
+   ============================================================ */
+
+.stApp {
+    background: #0B1220;
+    background: linear-gradient(180deg, #0B1220 0%, #0D1428 100%);
+    color: #FFFFFF;
+}
+
+/* ---------- Typography ---------- */
+
+.ada-chart-title {
+    font-size: 26px;
+    font-weight: 700;
+    color: #FFFFFF;
+    letter-spacing: -0.02em;
+    line-height: 1.25;
+    margin: 0 0 4px 0;
+}
+
+.ada-chart-subtitle {
+    font-size: 14px;
+    font-weight: 400;
+    color: #9CA3AF;
+    line-height: 1.5;
+    margin: 0 0 24px 0;
+}
+
+/* ---------- KPI cards ---------- */
+
+.ada-kpi-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.ada-kpi-card {
+    flex: 1 1 220px;
+    min-width: 200px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: #111827;
+    border: 1px solid #1F2937;
+    border-radius: 14px;
+    padding: 18px 20px;
+    animation: adaFadeUp 0.5s ease both;
+    transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.ada-kpi-card:hover {
+    transform: translateY(-3px);
+    border-color: #374151;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.ada-kpi-icon {
+    width: 42px;
+    height: 42px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    flex-shrink: 0;
+}
+
+.tone-success .ada-kpi-icon { background: rgba(34, 197, 94, 0.12); }
+.tone-danger  .ada-kpi-icon { background: rgba(239, 68, 68, 0.12); }
+.tone-info    .ada-kpi-icon { background: rgba(59, 130, 246, 0.12); }
+.tone-warning .ada-kpi-icon { background: rgba(245, 158, 11, 0.12); }
+.tone-neutral .ada-kpi-icon { background: rgba(156, 163, 175, 0.12); }
+
+.ada-kpi-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: #9CA3AF;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.ada-kpi-value {
+    font-size: 22px;
+    font-weight: 700;
+    color: #FFFFFF;
+    line-height: 1.2;
+}
+
+.ada-kpi-value.tone-success { color: #22C55E; }
+.ada-kpi-value.tone-danger  { color: #EF4444; }
+.ada-kpi-value.tone-info    { color: #3B82F6; }
+.ada-kpi-value.tone-warning { color: #F59E0B; }
+.ada-kpi-value.tone-neutral { color: #E5E7EB; }
+
+.ada-kpi-sub {
+    font-size: 13px;
+    color: #9CA3AF;
+    margin-top: 2px;
+}
+
+/* ---------- Chart frame ---------- */
+
+.ada-chart-frame {
+    background: #111827;
+    border: 1px solid #1F2937;
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 24px;
+    animation: adaFadeUp 0.5s ease both;
+}
+
+.ada-chart-frame img {
+    width: 100%;
+    border-radius: 10px;
+}
+
+/* ---------- Insight / Recommendation cards ---------- */
+
+.ada-card {
+    background: #111827;
+    border: 1px solid #1F2937;
+    border-radius: 16px;
+    padding: 24px 26px;
+    margin-bottom: 20px;
+    animation: adaFadeUp 0.5s ease both;
+}
+
+.ada-card-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.ada-card-icon {
+    font-size: 18px;
+}
+
+.ada-card-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: #FFFFFF;
+    letter-spacing: 0.01em;
+}
+
+.ada-card-body {
+    font-size: 15px;
+    color: #D1D5DB;
+    line-height: 1.65;
+}
+
+.ada-card-body p {
+    margin: 0 0 10px 0;
+}
+
+.ada-card-body p:last-child {
+    margin-bottom: 0;
+}
+
+.ada-card-body ul {
+    margin: 0;
+    padding-left: 20px;
+}
+
+.ada-card-body li {
+    margin-bottom: 8px;
+}
+
+.ada-card-body li:last-child {
+    margin-bottom: 0;
+}
+
+.ada-insight .ada-card-title { color: #3B82F6; }
+.ada-reco   .ada-card-title { color: #F59E0B; }
+
+/* ---------- Divider ---------- */
+
+hr.ada-divider {
+    border: none;
+    height: 1px;
+    background: #1F2937;
+    margin: 32px 0;
+}
+
+/* ---------- Streamlit chrome polish ---------- */
+
+[data-testid="stMetric"] {
+    background: #111827;
+    border: 1px solid #1F2937;
+    border-radius: 12px;
+    padding: 14px 16px;
+}
+
+.stButton > button[kind="primary"] {
+    background: #3B82F6;
+    border: none;
+    font-weight: 600;
+}
+
+.stButton > button[kind="primary"]:hover {
+    background: #2563EB;
+}
+
+.stTextArea textarea, .stTextInput input {
+    background: #111827;
+    border: 1px solid #1F2937;
+    color: #FFFFFF;
+    border-radius: 10px;
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    gap: 8px;
+}
+
+.stTabs [data-baseweb="tab"] {
+    border-radius: 10px 10px 0 0;
+    font-weight: 500;
+}
+
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #1F2937;
+    border-radius: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+/* ---------- Animation ---------- */
+
+@keyframes adaFadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+</style>
+"""
+
+
+def _inject_premium_theme() -> None:
+    """Inject the premium dark theme stylesheet into the app."""
+    st.markdown(_PREMIUM_CSS, unsafe_allow_html=True)
 
 
 def _json_safe(value: Any) -> Any:
@@ -410,6 +1076,7 @@ def _get_compiled_graph():
 def main() -> None:
     """Render Streamlit controls and run the analysis workflow."""
     st.set_page_config(page_title="AI Data Analysis Agent", layout="wide")
+    _inject_premium_theme()
     st.title("AI Data Analysis Agent")
 
     explain_mode = st.toggle("Explain mode", value=False)
@@ -527,22 +1194,7 @@ def main() -> None:
     with tab_charts:
         if chart_entries:
             for chart in chart_entries:
-                step_name = str(chart.get("step", "Chart step")).strip() or "Chart step"
-                tool_name = str(chart.get("tool", "visualization")).strip() or "visualization"
-                st.markdown(f"### {step_name} ({tool_name})")
-
-                chart_col, explain_col = st.columns([2, 1])
-
-                with chart_col:
-                    st.image(str(chart.get("path", "")), use_container_width=True)
-
-                with explain_col:
-                    st.markdown("#### Chart Explanation")
-                    chart_step_number = int(chart.get("step_number", 0))
-                    source_df = _find_chart_source_dataframe(step_results, chart_step_number)
-                    st.markdown(_build_chart_explanation(chart, source_df))
-
-                st.divider()
+                _render_chart_section(chart, step_results)
         else:
             st.info("No charts generated for this run.")
 
