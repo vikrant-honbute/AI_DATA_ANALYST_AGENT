@@ -2,16 +2,39 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import re
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 from config import get_settings
 from graph import build_workflow
 from graph.state import AgentState
+
+logger = logging.getLogger(__name__)
+
+try:
+    import plotly.graph_objects as go
+    _PLOTLY_AVAILABLE = True
+except ImportError:  # pragma: no cover - graceful fallback to static chart images.
+    _PLOTLY_AVAILABLE = False
+
+_PLOTLY_CARD_BG = "#111827"
+_PLOTLY_GRID = "#1F2937"
+_PLOTLY_TEXT = "#E5E7EB"
+_PLOTLY_MUTED = "#9CA3AF"
+_PLOTLY_BLUE = "#3B82F6"
+_PLOTLY_BLUE_LIGHT = "#60A5FA"
+_PLOTLY_BLUE_PALE = "#93C5FD"
+_PLOTLY_GREEN = "#22C55E"
+_PLOTLY_RED = "#EF4444"
+_PLOTLY_BLUE_PALETTE = (_PLOTLY_BLUE, _PLOTLY_BLUE_LIGHT, _PLOTLY_BLUE_PALE, "#7DD3FC", "#2563EB")
+_PLOTLY_CHART_HEIGHT = 420
+_PLOTLY_FONT = "Inter, -apple-system, 'Segoe UI', Roboto, sans-serif"
 
 
 def _build_initial_state(query: str, uploaded_df: pd.DataFrame | None) -> AgentState:
@@ -739,6 +762,605 @@ def _render_recommendations_card(items: list[str]) -> None:
     )
 
 
+def _plotly_base_layout(
+    x_title: str = "",
+    y_title: str = "",
+    height: int = _PLOTLY_CHART_HEIGHT,
+) -> dict:
+    """Shared dark-theme layout for all Plotly charts."""
+    return dict(
+        height=height,
+        margin=dict(l=64, r=20, t=20, b=44),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor=_PLOTLY_CARD_BG,
+        font=dict(family=_PLOTLY_FONT, color=_PLOTLY_TEXT, size=12),
+        xaxis=dict(
+            title=dict(text=x_title, font=dict(color=_PLOTLY_MUTED, size=12)),
+            tickfont=dict(color=_PLOTLY_MUTED, size=11),
+            gridcolor=_PLOTLY_GRID,
+            zeroline=False,
+            linecolor=_PLOTLY_GRID,
+        ),
+        yaxis=dict(
+            title=dict(text=y_title, font=dict(color=_PLOTLY_MUTED, size=12)),
+            tickfont=dict(color=_PLOTLY_MUTED, size=11),
+            gridcolor=_PLOTLY_GRID,
+            zeroline=False,
+            linecolor=_PLOTLY_GRID,
+        ),
+        hoverlabel=dict(
+            bgcolor="#1F2937",
+            bordercolor="#374151",
+            font=dict(color="#FFFFFF", size=12),
+        ),
+        showlegend=False,
+    )
+
+
+def _plotly_format_value(value: float, money: bool = False) -> str:
+    """Format a value compactly for chart labels: 108000 -> '$108K'."""
+    if value is None or pd.isna(value):
+        return ""
+    value = float(value)
+    prefix = "$" if money else ""
+    abs_value = abs(value)
+    if abs_value >= 1_000_000:
+        return f"{prefix}{value / 1_000_000:.1f}M"
+    if abs_value >= 1_000:
+        return f"{prefix}{value / 1_000:.0f}K"
+    if float(value).is_integer():
+        return f"{prefix}{int(value):,}"
+    return f"{prefix}{value:,.2f}"
+
+
+def _highlight_colors(values: list[float]) -> list[str]:
+    """Green for the best value, red for the worst, blue palette for the rest."""
+    if not values:
+        return []
+    best_index = max(range(len(values)), key=lambda i: values[i])
+    worst_index = min(range(len(values)), key=lambda i: values[i])
+    colors: list[str] = []
+    for index in range(len(values)):
+        if index == best_index:
+            colors.append(_PLOTLY_GREEN)
+        elif index == worst_index:
+            colors.append(_PLOTLY_RED)
+        else:
+            colors.append(_PLOTLY_BLUE_PALETTE[index % len(_PLOTLY_BLUE_PALETTE)])
+    return colors
+
+
+def _kde_density(series: pd.Series, n_points: int = 200) -> tuple[np.ndarray, np.ndarray] | None:
+    """Estimate a gaussian KDE over a numeric series using numpy only."""
+    values = pd.to_numeric(series, errors="coerce").dropna().astype(float)
+    if values.empty or values.nunique() < 2:
+        return None
+    std = float(values.std())
+    bandwidth = 1.06 * std * (len(values) ** -0.2)
+    if not np.isfinite(bandwidth) or bandwidth <= 0:
+        bandwidth = max(float(values.max() - values.min()) / 4.0, 1e-6)
+    grid = np.linspace(
+        float(values.min()) - 3 * bandwidth,
+        float(values.max()) + 3 * bandwidth,
+        n_points,
+    )
+    differences = grid[:, None] - values.to_numpy()[None, :]
+    density = np.mean(
+        np.exp(-0.5 * (differences / bandwidth) ** 2), axis=1
+    ) / (bandwidth * np.sqrt(2 * np.pi))
+    return grid, density
+
+
+def _plotly_bar(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> go.Figure | None:
+    """Modern bar chart with value labels and best/worst highlighting."""
+    if not numeric_cols:
+        return None
+    metric = numeric_cols[0]
+    metric_label = _prettify_name(metric)
+    money = _looks_like_money(metric_label)
+
+    if categorical_cols:
+        category = categorical_cols[0]
+        grouped = (
+            pd.to_numeric(df[metric], errors="coerce")
+            .groupby(df[category].astype(str), sort=False)
+            .sum()
+            .dropna()
+        )
+        if grouped.empty:
+            return None
+        labels = [str(label) for label in grouped.index]
+        values = [float(value) for value in grouped.values]
+        x_title = _prettify_name(category)
+    else:
+        series = pd.to_numeric(df[metric], errors="coerce").dropna()
+        if series.empty:
+            return None
+        labels = [str(index) for index in range(len(series))]
+        values = [float(value) for value in series.values]
+        x_title = ""
+
+    figure = go.Figure(
+        go.Bar(
+            x=labels,
+            y=values,
+            marker_color=_highlight_colors(values),
+            text=[_plotly_format_value(value, money) for value in values],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="%{x}<br>%{y:,.2f}<extra></extra>",
+        )
+    )
+    figure.update_layout(**_plotly_base_layout(x_title=x_title, y_title=metric_label))
+    if len(labels) > 12:
+        figure.update_xaxes(tickangle=45, tickfont=dict(size=10))
+    return figure
+
+
+def _plotly_line(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> go.Figure | None:
+    """Trend line with highlighted peak and trough markers."""
+    if not numeric_cols:
+        return None
+    metric_label = _prettify_name(numeric_cols[0])
+    money = _looks_like_money(metric_label)
+
+    if len(numeric_cols) >= 2 and not categorical_cols:
+        figure = go.Figure()
+        for index, metric in enumerate(numeric_cols[:3]):
+            series = pd.to_numeric(df[metric], errors="coerce").dropna()
+            figure.add_trace(
+                go.Scatter(
+                    x=[str(i) for i in range(len(series))],
+                    y=[float(value) for value in series.values],
+                    mode="lines+markers",
+                    name=_prettify_name(metric),
+                    line=dict(
+                        color=_PLOTLY_BLUE_PALETTE[index % len(_PLOTLY_BLUE_PALETTE)],
+                        width=3,
+                    ),
+                    marker=dict(size=5),
+                    hovertemplate=f"{_prettify_name(metric)}: %{{y:,.2f}}<extra></extra>",
+                )
+            )
+        figure.update_layout(**_plotly_base_layout(x_title="Index", y_title=metric_label))
+        figure.update_layout(showlegend=True, legend=dict(font=dict(color=_PLOTLY_MUTED)))
+        return figure
+
+    metric = numeric_cols[0]
+    series = pd.to_numeric(df[metric], errors="coerce").dropna()
+    if series.empty:
+        return None
+
+    if categorical_cols:
+        x_values = [
+            str(value) for value in df.loc[series.index, categorical_cols[0]].values
+        ]
+        x_title = _prettify_name(categorical_cols[0])
+    else:
+        x_values = [str(index) for index in range(len(series))]
+        x_title = "Index"
+
+    y_values = [float(value) for value in series.values]
+    show_text = len(y_values) <= 24
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=y_values,
+            mode="lines+markers",
+            line=dict(color=_PLOTLY_BLUE, width=3),
+            marker=dict(size=6, color=_PLOTLY_BLUE),
+            text=[_plotly_format_value(value, money) for value in y_values] if show_text else None,
+            textposition="top center",
+            textfont=dict(color=_PLOTLY_MUTED, size=10),
+            hovertemplate="%{x}<br>%{y:,.2f}<extra></extra>",
+        )
+    )
+
+    best_index = int(np.argmax(y_values))
+    worst_index = int(np.argmin(y_values))
+    for marker_index, color in ((best_index, _PLOTLY_GREEN), (worst_index, _PLOTLY_RED)):
+        figure.add_trace(
+            go.Scatter(
+                x=[x_values[marker_index]],
+                y=[y_values[marker_index]],
+                mode="markers",
+                marker=dict(
+                    color=color,
+                    size=14,
+                    symbol="diamond",
+                    line=dict(color="#FFFFFF", width=1.5),
+                ),
+                hovertemplate="%{x}<br>%{y:,.2f}<extra></extra>",
+            )
+        )
+
+    figure.update_layout(**_plotly_base_layout(x_title=x_title, y_title=metric_label))
+    return figure
+
+
+def _plotly_area(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> go.Figure | None:
+    """Filled area chart reusing the line logic with an area fill."""
+    figure = _plotly_line(df, numeric_cols, categorical_cols)
+    if figure is None:
+        return None
+    for trace in figure.data:
+        trace.fill = "tozeroy"
+        trace.fillcolor = "rgba(59, 130, 246, 0.15)"
+    figure.update_layout(**_plotly_base_layout(height=_PLOTLY_CHART_HEIGHT))
+    return figure
+
+
+def _plotly_scatter(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+) -> go.Figure | None:
+    """Scatter plot highlighting the top value in green."""
+    if len(numeric_cols) < 2:
+        return None
+    x_col, y_col = numeric_cols[0], numeric_cols[1]
+    x_values = pd.to_numeric(df[x_col], errors="coerce")
+    y_values = pd.to_numeric(df[y_col], errors="coerce")
+    mask = x_values.notna() & y_values.notna()
+    x_values, y_values = x_values[mask], y_values[mask]
+    if x_values.empty:
+        return None
+
+    colors = [_PLOTLY_BLUE_LIGHT] * len(x_values)
+    best_index = int(np.argmax(y_values.values))
+    colors[best_index] = _PLOTLY_GREEN
+
+    figure = go.Figure(
+        go.Scatter(
+            x=x_values,
+            y=y_values,
+            mode="markers",
+            marker=dict(
+                size=9,
+                color=colors,
+                opacity=0.85,
+                line=dict(color=_PLOTLY_CARD_BG, width=0.5),
+            ),
+            hovertemplate="%{x:,.2f}<br>%{y:,.2f}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        **_plotly_base_layout(x_title=_prettify_name(x_col), y_title=_prettify_name(y_col))
+    )
+    return figure
+
+
+def _plotly_bubble(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+) -> go.Figure | None:
+    """Bubble chart with a size dimension when three numeric columns exist."""
+    if len(numeric_cols) < 3:
+        return _plotly_scatter(df, numeric_cols)
+    x_col, y_col, size_col = numeric_cols[:3]
+    x_values = pd.to_numeric(df[x_col], errors="coerce")
+    y_values = pd.to_numeric(df[y_col], errors="coerce")
+    size_values = pd.to_numeric(df[size_col], errors="coerce")
+    mask = x_values.notna() & y_values.notna() & size_values.notna()
+    x_values, y_values, size_values = x_values[mask], y_values[mask], size_values[mask]
+    if x_values.empty:
+        return None
+
+    size_min, size_max = float(size_values.min()), float(size_values.max())
+    size_range = size_max - size_min if size_max > size_min else 1.0
+    marker_sizes = 12 + 48 * (size_values - size_min) / size_range
+
+    figure = go.Figure(
+        go.Scatter(
+            x=x_values,
+            y=y_values,
+            mode="markers",
+            marker=dict(
+                size=marker_sizes,
+                color=_PLOTLY_BLUE_LIGHT,
+                opacity=0.75,
+                line=dict(color=_PLOTLY_CARD_BG, width=0.5),
+            ),
+            text=[_plotly_format_value(value) for value in size_values.values],
+            textposition="middle center",
+            textfont=dict(color="#FFFFFF", size=9),
+            hovertemplate=f"{_prettify_name(size_col)}: %{{text}}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        **_plotly_base_layout(x_title=_prettify_name(x_col), y_title=_prettify_name(y_col))
+    )
+    return figure
+
+
+def _plotly_pie(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> go.Figure | None:
+    """Donut chart with best/worst slice highlighting."""
+    if not numeric_cols:
+        return None
+    metric = numeric_cols[0]
+    if categorical_cols:
+        grouped = (
+            pd.to_numeric(df[metric], errors="coerce")
+            .groupby(df[categorical_cols[0]].astype(str), sort=False)
+            .sum()
+            .dropna()
+        )
+    else:
+        grouped = pd.to_numeric(df[metric], errors="coerce").dropna()
+    if grouped.empty:
+        return None
+
+    labels = [str(label) for label in grouped.index]
+    values = [float(value) for value in grouped.values]
+
+    figure = go.Figure(
+        go.Pie(
+            labels=labels,
+            values=values,
+            hole=0.45,
+            marker=dict(
+                colors=_highlight_colors(values),
+                line=dict(color=_PLOTLY_CARD_BG, width=2),
+            ),
+            textinfo="label+percent",
+            textfont=dict(color="#FFFFFF", size=12),
+            hovertemplate="%{label}<br>%{value:,.2f} (%{percent})<extra></extra>",
+        )
+    )
+    figure.update_layout(**_plotly_base_layout())
+    return figure
+
+
+def _plotly_hist(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+) -> go.Figure | None:
+    """Clean histogram with 20 bins."""
+    if not numeric_cols:
+        return None
+    metric = numeric_cols[0]
+    series = pd.to_numeric(df[metric], errors="coerce").dropna()
+    if series.empty:
+        return None
+    figure = go.Figure(
+        go.Histogram(
+            x=series,
+            nbinsx=20,
+            marker_color=_PLOTLY_BLUE,
+            opacity=0.85,
+            marker_line=dict(color=_PLOTLY_CARD_BG, width=1),
+            hovertemplate="%{x:,.2f}<br>Count: %{y}<extra></extra>",
+        )
+    )
+    figure.update_layout(**_plotly_base_layout(x_title=_prettify_name(metric), y_title="Count"))
+    return figure
+
+
+def _plotly_kde(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+) -> go.Figure | None:
+    """Smoothed density curve rendered from a numpy KDE estimate."""
+    if not numeric_cols:
+        return None
+    metric = numeric_cols[0]
+    estimate = _kde_density(df[metric])
+    if estimate is None:
+        return None
+    grid, density = estimate
+    figure = go.Figure(
+        go.Scatter(
+            x=grid,
+            y=density,
+            mode="lines",
+            line=dict(color=_PLOTLY_BLUE, width=3),
+            fill="tozeroy",
+            fillcolor="rgba(59, 130, 246, 0.15)",
+            hovertemplate="%{x:,.2f}<br>Density: %{y:.3f}<extra></extra>",
+        )
+    )
+    figure.update_layout(**_plotly_base_layout(x_title=_prettify_name(metric), y_title="Density"))
+    return figure
+
+
+def _plotly_box(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> go.Figure | None:
+    """Box plot with mean markers, grouped by category when present."""
+    if not numeric_cols:
+        return None
+    metric = numeric_cols[0]
+    metric_label = _prettify_name(metric)
+    figure = go.Figure()
+    if categorical_cols:
+        category = categorical_cols[0]
+        for label, subset in df.groupby(df[category].astype(str), sort=False):
+            values = pd.to_numeric(subset[metric], errors="coerce").dropna()
+            figure.add_trace(
+                go.Box(
+                    y=values,
+                    name=str(label),
+                    boxmean=True,
+                    marker_color=_PLOTLY_BLUE,
+                    line=dict(color=_PLOTLY_BLUE_LIGHT, width=2),
+                    fillcolor="rgba(59, 130, 246, 0.18)",
+                )
+            )
+        x_title = _prettify_name(category)
+    else:
+        values = pd.to_numeric(df[metric], errors="coerce").dropna()
+        figure.add_trace(
+            go.Box(
+                y=values,
+                boxmean=True,
+                marker_color=_PLOTLY_BLUE,
+                line=dict(color=_PLOTLY_BLUE_LIGHT, width=2),
+                fillcolor="rgba(59, 130, 246, 0.18)",
+            )
+        )
+        x_title = ""
+    figure.update_layout(**_plotly_base_layout(x_title=x_title, y_title=metric_label))
+    return figure
+
+
+def _plotly_violin(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> go.Figure | None:
+    """Violin plot with an inner box, grouped by category when present."""
+    if not numeric_cols:
+        return None
+    metric = numeric_cols[0]
+    metric_label = _prettify_name(metric)
+    figure = go.Figure()
+    if categorical_cols:
+        category = categorical_cols[0]
+        for label, subset in df.groupby(df[category].astype(str), sort=False):
+            values = pd.to_numeric(subset[metric], errors="coerce").dropna()
+            figure.add_trace(
+                go.Violin(
+                    y=values,
+                    name=str(label),
+                    box_visible=True,
+                    meanline_visible=True,
+                    line=dict(color=_PLOTLY_BLUE_LIGHT, width=2),
+                    fillcolor="rgba(59, 130, 246, 0.25)",
+                    opacity=0.9,
+                )
+            )
+        x_title = _prettify_name(category)
+    else:
+        values = pd.to_numeric(df[metric], errors="coerce").dropna()
+        figure.add_trace(
+            go.Violin(
+                y=values,
+                box_visible=True,
+                meanline_visible=True,
+                line=dict(color=_PLOTLY_BLUE_LIGHT, width=2),
+                fillcolor="rgba(59, 130, 246, 0.25)",
+                opacity=0.9,
+            )
+        )
+        x_title = ""
+    figure.update_layout(**_plotly_base_layout(x_title=x_title, y_title=metric_label))
+    return figure
+
+
+def _plotly_heatmap(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+) -> go.Figure | None:
+    """Correlation heatmap with annotated values."""
+    if len(numeric_cols) < 2:
+        return None
+    corr = df[numeric_cols].corr()
+    figure = go.Figure(
+        go.Heatmap(
+            z=corr.values,
+            x=[str(col) for col in corr.columns],
+            y=[str(col) for col in corr.index],
+            zmin=-1,
+            zmax=1,
+            text=np.round(corr.values, 2),
+            texttemplate="%{text}",
+            colorscale=[
+                [0.0, "#EF4444"],
+                [0.5, "#1E293B"],
+                [1.0, "#3B82F6"],
+            ],
+            colorbar=dict(
+                title=dict(text="Corr", font=dict(color=_PLOTLY_MUTED, size=11)),
+                tickfont=dict(color=_PLOTLY_MUTED, size=10),
+            ),
+            hovertemplate="%{y} vs %{x}: %{z:.2f}<extra></extra>",
+        )
+    )
+    figure.update_layout(**_plotly_base_layout(height=400))
+    figure.update_xaxes(tickangle=45)
+    return figure
+
+
+def _build_plotly_figure(chart: dict[str, Any], source_df: pd.DataFrame | None) -> go.Figure | None:
+    """Build an interactive Plotly figure mirroring the backend chart intent."""
+    if not _PLOTLY_AVAILABLE:
+        return None
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        return None
+
+    chart_type = str(chart.get("chart_type", "")).lower()
+    numeric_cols = list(source_df.select_dtypes(include="number").columns)
+    categorical_cols = [col for col in source_df.columns if col not in numeric_cols]
+
+    if chart_type == "bar":
+        return _plotly_bar(source_df, numeric_cols, categorical_cols)
+    if chart_type == "line":
+        return _plotly_line(source_df, numeric_cols, categorical_cols)
+    if chart_type == "area":
+        return _plotly_area(source_df, numeric_cols, categorical_cols)
+    if chart_type == "scatter":
+        return _plotly_scatter(source_df, numeric_cols)
+    if chart_type == "bubble":
+        return _plotly_bubble(source_df, numeric_cols)
+    if chart_type == "pie":
+        return _plotly_pie(source_df, numeric_cols, categorical_cols)
+    if chart_type == "hist":
+        return _plotly_hist(source_df, numeric_cols)
+    if chart_type == "kde":
+        return _plotly_kde(source_df, numeric_cols)
+    if chart_type in {"box", "boxplot"}:
+        return _plotly_box(source_df, numeric_cols, categorical_cols)
+    if chart_type == "violin":
+        return _plotly_violin(source_df, numeric_cols, categorical_cols)
+    if chart_type == "heatmap":
+        return _plotly_heatmap(source_df, numeric_cols)
+
+    return None
+
+
+def _render_plotly_chart(chart: dict[str, Any], source_df: pd.DataFrame | None) -> bool:
+    """Render an interactive Plotly chart; return False when falling back to the image."""
+    try:
+        figure = _build_plotly_figure(chart, source_df)
+        if figure is None:
+            logger.warning(
+                "Plotly render skipped for chart '%s': unsupported type or missing source data",
+                chart.get("chart_type"),
+            )
+            return False
+        st.plotly_chart(
+            figure,
+            use_container_width=True,
+            config={"displayModeBar": False, "responsive": True, "scrollZoom": False},
+        )
+        return True
+    except Exception as exc:  # pragma: no cover - fallback path
+        logger.warning(
+            "Plotly render failed for chart '%s': %s",
+            chart.get("chart_type"),
+            exc,
+        )
+        return False
+
+
 def _render_chart_section(chart: dict[str, Any], step_results: list[dict[str, Any]]) -> None:
     """Render one complete chart section: title, KPIs, chart, insights, recommendations."""
     chart_step_number = int(chart.get("step_number", 0))
@@ -758,7 +1380,8 @@ def _render_chart_section(chart: dict[str, Any], step_results: list[dict[str, An
     _render_kpi_cards(analysis.get("kpis", []))
 
     st.markdown('<div class="ada-chart-frame">', unsafe_allow_html=True)
-    st.image(str(chart.get("path", "")), use_container_width=True)
+    if not _render_plotly_chart(chart, source_df):
+        st.image(str(chart.get("path", "")), use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     insight_text = _build_business_insight(chart, analysis)

@@ -6,6 +6,7 @@ groq
 pydantic
 pandas
 matplotlib
+plotly
 SQLAlchemy
 psycopg2-binary
 pymongo
