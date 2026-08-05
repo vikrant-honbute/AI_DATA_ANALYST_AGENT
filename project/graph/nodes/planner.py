@@ -13,11 +13,18 @@ from langchain_core.output_parsers import PydanticOutputParser
 import pandas as pd
 from pydantic import BaseModel, Field
 
-from graph.state import AgentState, DataSource
-from llm import get_llm
-from prompts import render_prompt
-from tools.memory_tool import get_recent_memory
-from tools.sql_tool import fetch_postgres_schema
+try:
+    from graph.state import AgentState, DataSource
+    from llm import get_llm
+    from prompts import render_prompt
+    from tools.memory_tool import get_recent_memory
+    from tools.sql_tool import fetch_postgres_schema
+except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
+    from project.graph.state import AgentState, DataSource
+    from project.llm import get_llm
+    from project.prompts import render_prompt
+    from project.tools.memory_tool import get_recent_memory
+    from project.tools.sql_tool import fetch_postgres_schema
 
 logger = logging.getLogger(__name__)
 
@@ -96,17 +103,13 @@ def _extract_text(content: Any) -> str:
 
 def _is_explicit_database_request(query: str) -> bool:
     """Return True when query explicitly asks for SQL/database backends."""
-    lowered = query.lower()
-    db_tokens = [
-        "postgres",
-        "postgresql",
-        "database",
-        "db",
-        "sql",
-        "table",
-        "schema",
-    ]
-    return any(token in lowered for token in db_tokens)
+    return bool(
+        re.search(
+            r"\b(?:postgres|postgresql|database|db|sql|schema|database\s+table)\b",
+            query,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _heuristic_route(query: str, has_uploaded_csv: bool) -> DataSource:
@@ -154,6 +157,8 @@ def _query_relates_to_past(query: str) -> bool:
         "before",
         "again",
         "history",
+        "context",
+        "memory",
         "past",
         "last time",
         "compare with",
@@ -187,10 +192,12 @@ def _normalize_memory_item(item: dict[str, Any], result_char_limit: int = 300) -
     }
 
 
-def _fetch_recent_memory(limit: int = 5) -> list[dict[str, Any]]:
+def _fetch_recent_memory(limit: int = 5, session_id: str = "") -> list[dict[str, Any]]:
     """Fetch recent memory records from MongoDB with safe fallback."""
+    if not session_id:
+        return []
     try:
-        return get_recent_memory(limit=limit)
+        return get_recent_memory(session_id=session_id, limit=limit)
     except Exception as exc:
         logger.warning(
             "planner[_fetch_recent_memory] failed to fetch recent memory; "
@@ -229,16 +236,17 @@ def _plan_has_memory_context(plan: list[dict[str, Any]]) -> bool:
 def _prepend_memory_step(
     plan: list[dict[str, Any]], memory_context: list[dict[str, str]]
 ) -> list[dict[str, Any]]:
-    """Ensure plan contains an executable step that carries reused memory context."""
+    """Ensure relevant, scoped memory is displayed through a trusted operation."""
     if not memory_context or _plan_has_memory_context(plan):
         return plan
-
-    memory_step = {
-        "step": "Load relevant historical context",
-        "tool": "pandas",
-        "action": "result = " + repr({"memory_context": memory_context}),
-    }
-    return [memory_step, *plan]
+    return [
+        {
+            "step": "Load relevant historical context",
+            "tool": "pandas",
+            "action": json.dumps({"operation": "memory_records", "limit": 3}),
+        },
+        *plan,
+    ]
 
 
 def route_data_source(query: str, has_uploaded_csv: bool = False) -> DataSource:
@@ -312,22 +320,21 @@ def _fallback_csv_action(query: str, csv_columns: list[str]) -> str:
             ["total_revenue", "revenue", "sales", "amount", "income", "total"],
         )
         if metric_col is not None:
-            return (
-                "result = pd.DataFrame([{'metric': 'total', "
-                f"'column': {metric_col!r}, 'value': float(df[{metric_col!r}].sum())}}])"
+            return json.dumps(
+                {"operation": "aggregate", "column": metric_col, "function": "sum"}
             )
-        return (
-            "result = pd.DataFrame([{'metric': 'total_numeric_sum', "
-            "'value': float(df.select_dtypes(include='number').sum().sum())}])"
-        )
+        return json.dumps({"operation": "head", "limit": 20})
 
     if any(token in lowered for token in ["average", "avg", "mean"]):
-        return (
-            "result = df.select_dtypes(include='number').mean().reset_index()"
-            ".rename(columns={'index': 'metric', 0: 'value'})"
+        metric_col = _find_metric_column(
+            csv_columns, ["revenue", "sales", "amount", "income", "price", "quantity"]
         )
+        if metric_col is not None:
+            return json.dumps(
+                {"operation": "aggregate", "column": metric_col, "function": "mean"}
+            )
 
-    return "result = df.head(20)"
+    return json.dumps({"operation": "head", "limit": 20})
 
 
 def _contains_file_load_action(action: str) -> bool:
@@ -414,21 +421,24 @@ def _rewrite_csv_column_references(action: str, csv_columns: list[str]) -> str:
 
 
 def _sanitize_csv_pandas_action(action: str, query: str, csv_columns: list[str]) -> str:
-    """Normalize CSV pandas actions to avoid file I/O and invalid columns."""
-    candidate = action.strip()
-
-    if not candidate or _contains_file_load_action(candidate):
+    """Accept only declarative operations referencing known CSV columns."""
+    try:
+        spec = json.loads(action)
+    except (TypeError, json.JSONDecodeError):
         return _fallback_csv_action(query, csv_columns)
-
-    candidate = _rewrite_csv_column_references(candidate, csv_columns)
-
-    if _has_unknown_column_reference(candidate, csv_columns):
+    if not isinstance(spec, dict) or not isinstance(spec.get("operation"), str):
         return _fallback_csv_action(query, csv_columns)
-
-    if "result" not in candidate:
+    known = {column.lower() for column in csv_columns}
+    requested: list[str] = []
+    for key in ("column",):
+        if spec.get(key) is not None:
+            requested.append(str(spec[key]))
+    for key in ("columns", "by"):
+        if isinstance(spec.get(key), list):
+            requested.extend(str(item) for item in spec[key])
+    if any(column.lower() not in known for column in requested):
         return _fallback_csv_action(query, csv_columns)
-
-    return candidate
+    return json.dumps(spec, ensure_ascii=True)
 
 
 def _fallback_output(
@@ -453,7 +463,7 @@ def _fallback_output(
         step = PlannerStepModel(
             step="Summarize memory context",
             tool="pandas",
-            action="result = {'summary': 'Context-first analysis plan'}",
+            action=json.dumps({"operation": "memory_records", "limit": 5}),
         )
 
     return PlannerOutputModel(
@@ -490,8 +500,14 @@ def _sanitize_plan_for_data_source(
         if tool == "pandas":
             if data_source == "csv":
                 action = _sanitize_csv_pandas_action(action, query, csv_columns)
-            elif "result" not in action:
-                action = "result = df.head(20)"
+            else:
+                try:
+                    parsed_action = json.loads(action)
+                    if not isinstance(parsed_action, dict) or "operation" not in parsed_action:
+                        raise ValueError
+                    action = json.dumps(parsed_action, ensure_ascii=True)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    action = json.dumps({"operation": "memory_records", "limit": 5})
 
         if tool == "visualization" and not action:
             action = "Create a line chart using the primary numeric column"
@@ -539,7 +555,7 @@ def _ensure_required_steps(
             {
                 "step": "Summarize memory context",
                 "tool": "pandas",
-                "action": "result = {'summary': 'Context-first analysis plan'}",
+                "action": json.dumps({"operation": "memory_records", "limit": 5}),
             },
             *plan,
         ]
@@ -556,7 +572,8 @@ def planner_node(state: AgentState) -> AgentState:
 
     routed_data_source = route_data_source(query, has_uploaded_csv=has_uploaded_csv)
     schema_text = _get_schema_text_for_prompt(routed_data_source)
-    recent_memory = _fetch_recent_memory(limit=5)
+    session_id = str(state.get("session_id", "")).strip()
+    recent_memory = _fetch_recent_memory(limit=5, session_id=session_id)
     selected_memory = _select_relevant_memory(query, recent_memory)
 
     parser = PydanticOutputParser(pydantic_object=PlannerOutputModel)

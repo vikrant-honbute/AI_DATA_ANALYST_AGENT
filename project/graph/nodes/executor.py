@@ -9,8 +9,12 @@ from typing import Any
 
 import pandas as pd
 
-from graph.state import AgentState
-from tools import generate_plot, query_postgres, run_pandas_code
+try:
+    from graph.state import AgentState
+    from tools import generate_plot, query_postgres, run_pandas_code
+except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
+    from project.graph.state import AgentState
+    from project.tools import generate_plot, query_postgres, run_pandas_code
 
 
 _PREVIEW_ROW_LIMIT = 8
@@ -106,6 +110,10 @@ def _build_final_result(step_results: list[dict[str, Any]]) -> str:
 
 def _initial_dataframe_from_state(state: AgentState) -> pd.DataFrame:
     """Return the starting DataFrame from state when available."""
+    if state.get("data_source") == "mongo":
+        raw_memory = state.get("memory", [])
+        if isinstance(raw_memory, list):
+            return pd.DataFrame(raw_memory)
     raw_df = state.get("uploaded_dataframe")
     if isinstance(raw_df, pd.DataFrame):
         return raw_df.copy(deep=True)
@@ -113,10 +121,27 @@ def _initial_dataframe_from_state(state: AgentState) -> pd.DataFrame:
 
 
 def _extract_referenced_columns(action: str) -> list[str]:
-    """Extract column names referenced as df['column'] in pandas actions."""
+    """Extract column names from declarative pandas operation actions."""
     if not action:
         return []
-    return re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]", action)
+
+    try:
+        spec = json.loads(action)
+    except (TypeError, json.JSONDecodeError):
+        return re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]", action)
+
+    if not isinstance(spec, dict):
+        return []
+
+    referenced: list[str] = []
+    for key in ("column",):
+        if isinstance(spec.get(key), str):
+            referenced.append(spec[key])
+    for key in ("columns", "by"):
+        value = spec.get(key)
+        if isinstance(value, list):
+            referenced.extend(str(item) for item in value if item is not None)
+    return referenced
 
 
 def _select_execution_dataframe(
@@ -148,10 +173,9 @@ def _select_execution_dataframe(
 
 
 def _series_to_step_dataframe(series: pd.Series) -> pd.DataFrame:
-    """Convert a pandas Series into a one-row DataFrame for safe step chaining."""
-    one_row = series.to_frame().T
-    one_row.columns = [str(col) for col in one_row.columns]
-    return one_row.reset_index(drop=True)
+    """Preserve Series index values as rows for safe step chaining."""
+    value_name = str(series.name) if series.name is not None else "value"
+    return series.rename(value_name).reset_index()
 
 
 def executor_node(state: AgentState) -> AgentState:
@@ -186,7 +210,11 @@ def executor_node(state: AgentState) -> AgentState:
                 source_df = sql_result.copy(deep=True)
                 result: Any = sql_result
             elif tool == "pandas":
-                pandas_code = action if action else "result = df"
+                pandas_code = (
+                    action
+                    if action
+                    else json.dumps({"operation": "head", "limit": 20})
+                )
                 execution_df = _select_execution_dataframe(action, working_df, source_df)
                 pandas_result = run_pandas_code(pandas_code, execution_df)
                 if isinstance(pandas_result, pd.DataFrame):

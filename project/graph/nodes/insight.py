@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from graph.state import AgentState
-from graph.nodes.critic import MAX_RETRIES
-from llm import get_llm
-from prompts import render_prompt
-from tools.memory_tool import save_memory
+try:
+    from graph.state import AgentState
+    from graph.nodes.critic import MAX_RETRIES
+    from llm import get_llm
+    from prompts import render_prompt
+    from tools.memory_tool import save_memory
+except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
+    from project.graph.state import AgentState
+    from project.graph.nodes.critic import MAX_RETRIES
+    from project.llm import get_llm
+    from project.prompts import render_prompt
+    from project.tools.memory_tool import save_memory
 
 
 _MEMORY_RESULT_CHAR_LIMIT = 1200
+logger = logging.getLogger(__name__)
 
 
 def _build_insight_prompt(final_result: str) -> str:
@@ -51,10 +60,10 @@ def _should_save_memory(state: AgentState, final_result: str) -> bool:
     retry_count = raw_retry_count if isinstance(raw_retry_count, int) else 0
 
     raw_results = state.get("intermediate_results", [])
-    last_step = raw_results[-1] if isinstance(raw_results, list) and raw_results else None
-    last_step_has_error = isinstance(last_step, dict) and "error" in last_step
-
-    return not (last_step_has_error and retry_count >= MAX_RETRIES)
+    has_error = isinstance(raw_results, list) and any(
+        isinstance(step, dict) and "error" in step for step in raw_results
+    )
+    return not has_error and retry_count <= MAX_RETRIES
 
 
 def insight_node(state: AgentState) -> AgentState:
@@ -76,16 +85,19 @@ def insight_node(state: AgentState) -> AgentState:
         insights = f"Insight generation error: {exc}"
 
     if _should_save_memory(state, final_result):
+        session_id = str(state.get("session_id", "")).strip()
         try:
-            save_memory(
-                state["query"],
-                {
-                    "final_result": _compact_text(final_result),
-                    "data_source": str(state.get("data_source", "unknown")),
-                },
-            )
-        except Exception:
-            pass
+            if session_id:
+                save_memory(
+                    session_id,
+                    state["query"],
+                    {
+                        "final_result": _compact_text(final_result),
+                        "data_source": str(state.get("data_source", "unknown")),
+                    },
+                )
+        except Exception as exc:
+            logger.warning("Failed to persist scoped memory: %s", exc)
 
     return {
         **state,

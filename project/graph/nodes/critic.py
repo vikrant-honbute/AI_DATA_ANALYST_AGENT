@@ -2,29 +2,23 @@
 
 from __future__ import annotations
 
-import difflib
 import json
-import re
 from typing import Any, Literal
 
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 
-from graph.state import AgentState
-from llm import get_llm
-from prompts import render_prompt
+try:
+    from graph.state import AgentState
+    from llm import get_llm
+    from prompts import render_prompt
+except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
+    from project.graph.state import AgentState
+    from project.llm import get_llm
+    from project.prompts import render_prompt
 
 
 MAX_RETRIES = 2
-
-_FILE_LOAD_MARKERS = (
-    "read_csv(",
-    "read_excel(",
-    "read_parquet(",
-    "read_json(",
-    "read_table(",
-    "read_pickle(",
-)
 
 
 class CriticStepModel(BaseModel):
@@ -144,89 +138,6 @@ def _extract_csv_columns_from_state(state: AgentState) -> list[str]:
         return []
 
 
-def _normalize_column_token(column_name: str) -> str:
-    """Normalize column tokens for fuzzy matching."""
-    return re.sub(r"[^a-z0-9]+", "", column_name.lower())
-
-
-def _closest_csv_column(target: str, csv_columns: list[str]) -> str | None:
-    """Find the nearest available CSV column for a requested name."""
-    normalized_target = _normalize_column_token(target)
-    if not normalized_target:
-        return None
-
-    normalized_pairs: list[tuple[str, str]] = []
-    for column in csv_columns:
-        normalized = _normalize_column_token(column)
-        if normalized:
-            normalized_pairs.append((normalized, column))
-
-    if not normalized_pairs:
-        return None
-
-    for normalized, column in normalized_pairs:
-        if normalized == normalized_target:
-            return column
-
-    for normalized, column in normalized_pairs:
-        if normalized_target in normalized or normalized in normalized_target:
-            return column
-
-    candidates = [normalized for normalized, _ in normalized_pairs]
-    match = difflib.get_close_matches(normalized_target, candidates, n=1, cutoff=0.75)
-    if not match:
-        return None
-
-    matched_token = match[0]
-    for normalized, column in normalized_pairs:
-        if normalized == matched_token:
-            return column
-
-    return None
-
-
-def _extract_referenced_columns(action: str) -> list[str]:
-    """Extract df['column'] references from pandas action text."""
-    return re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]", action)
-
-
-def _has_unknown_column_reference(action: str, csv_columns: list[str]) -> bool:
-    """Return True if action references columns not present in uploaded CSV."""
-    if not csv_columns:
-        return False
-
-    known = {column.lower() for column in csv_columns}
-    for referenced in _extract_referenced_columns(action):
-        if referenced.lower() not in known:
-            return True
-
-    return False
-
-
-def _rewrite_csv_column_references(action: str, csv_columns: list[str]) -> str:
-    """Rewrite unknown df['col'] references to closest available CSV columns."""
-    if not csv_columns:
-        return action
-
-    pattern = re.compile(r"df\[\s*(['\"])([^'\"]+)\1\s*\]")
-
-    def _replace(match: re.Match[str]) -> str:
-        quote = match.group(1)
-        raw_column = match.group(2)
-        replacement = _closest_csv_column(raw_column, csv_columns)
-        if replacement is None:
-            return match.group(0)
-        return f"df[{quote}{replacement}{quote}]"
-
-    return pattern.sub(_replace, action)
-
-
-def _contains_file_load_action(action: str) -> bool:
-    """Return True if pandas action tries to read files directly."""
-    lowered = action.lower()
-    return any(marker in lowered for marker in _FILE_LOAD_MARKERS)
-
-
 def _find_metric_column(csv_columns: list[str], keywords: list[str]) -> str | None:
     """Find the first matching metric column by keyword."""
     lowered_map = {column.lower(): column for column in csv_columns}
@@ -237,8 +148,17 @@ def _find_metric_column(csv_columns: list[str], keywords: list[str]) -> str | No
     return None
 
 
+def _is_declarative_json_action(action: str) -> bool:
+    """Return True when action is a valid declarative JSON operation."""
+    try:
+        spec = json.loads(action)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(spec, dict) and isinstance(spec.get("operation"), str)
+
+
 def _fallback_csv_retry_action(query: str, csv_columns: list[str]) -> str:
-    """Build a deterministic pandas retry action for CSV workflows."""
+    """Build a declarative pandas retry operation for CSV workflows."""
     lowered = query.lower()
 
     if any(token in lowered for token in ["total", "sum"]):
@@ -247,22 +167,42 @@ def _fallback_csv_retry_action(query: str, csv_columns: list[str]) -> str:
             ["total_revenue", "revenue", "sales", "amount", "income", "total"],
         )
         if metric_col is not None:
-            return (
-                "result = pd.DataFrame([{'metric': 'total', "
-                f"'column': {metric_col!r}, 'value': float(df[{metric_col!r}].sum())}}])"
+            return json.dumps(
+                {"operation": "aggregate", "column": metric_col, "function": "sum"}
             )
-        return (
-            "result = pd.DataFrame([{'metric': 'total_numeric_sum', "
-            "'value': float(df.select_dtypes(include='number').sum().sum())}])"
-        )
+        return json.dumps({"operation": "head", "limit": 20})
 
     if any(token in lowered for token in ["average", "avg", "mean"]):
-        return (
-            "result = df.select_dtypes(include='number').mean().reset_index()"
-            ".rename(columns={'index': 'metric', 0: 'value'})"
+        metric_col = _find_metric_column(
+            csv_columns, ["revenue", "sales", "amount", "income", "price", "quantity"]
         )
+        if metric_col is not None:
+            return json.dumps(
+                {"operation": "aggregate", "column": metric_col, "function": "mean"}
+            )
 
-    return "result = df.head(20)"
+    return json.dumps({"operation": "head", "limit": 20})
+
+
+def _sanitize_csv_retry_action(action: str, query: str, csv_columns: list[str]) -> str:
+    """Accept only declarative operations referencing known CSV columns."""
+    try:
+        spec = json.loads(action)
+    except (TypeError, json.JSONDecodeError):
+        return _fallback_csv_retry_action(query, csv_columns)
+    if not isinstance(spec, dict) or not isinstance(spec.get("operation"), str):
+        return _fallback_csv_retry_action(query, csv_columns)
+    known = {column.lower() for column in csv_columns}
+    requested: list[str] = []
+    for key in ("column",):
+        if spec.get(key) is not None:
+            requested.append(str(spec[key]))
+    for key in ("columns", "by"):
+        if isinstance(spec.get(key), list):
+            requested.extend(str(item) for item in spec[key])
+    if any(column.lower() not in known for column in requested):
+        return _fallback_csv_retry_action(query, csv_columns)
+    return json.dumps(spec, ensure_ascii=True)
 
 
 def _sanitize_corrected_plan(
@@ -297,18 +237,15 @@ def _sanitize_corrected_plan(
 
         if tool == "pandas":
             if data_source == "csv":
-                if _contains_file_load_action(action):
-                    action = _fallback_csv_retry_action(query, csv_columns)
-                else:
-                    action = _rewrite_csv_column_references(action, csv_columns)
-
-                if _has_unknown_column_reference(action, csv_columns):
-                    action = _fallback_csv_retry_action(query, csv_columns)
-
-                if "result" not in action:
-                    action = _fallback_csv_retry_action(query, csv_columns)
-            elif "result" not in action:
-                action = "result = df.head(20)"
+                action = _sanitize_csv_retry_action(action, query, csv_columns)
+            else:
+                try:
+                    parsed_action = json.loads(action)
+                    if not isinstance(parsed_action, dict) or "operation" not in parsed_action:
+                        raise ValueError
+                    action = json.dumps(parsed_action, ensure_ascii=True)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    action = json.dumps({"operation": "memory_records", "limit": 5})
 
         if tool == "visualization" and not action:
             action = "Create a bar chart using the first numeric column"
@@ -375,9 +312,11 @@ def _build_fallback_corrected_plan(
             corrected[index]["step"] = "Retry SQL with safe row limit"
             corrected[index]["action"] = _with_sql_limit(original_action)
         elif tool == "pandas":
-            corrected[index]["step"] = "Retry pandas step with explicit result output"
+            corrected[index]["step"] = "Retry pandas step with a declarative operation"
             corrected[index]["action"] = (
-                original_action if "result" in original_action else "result = df.head(20)"
+                original_action
+                if _is_declarative_json_action(original_action)
+                else json.dumps({"operation": "head", "limit": 20})
             )
         else:
             corrected[index]["step"] = "Retry visualization using first numeric column"
@@ -394,7 +333,7 @@ def _build_fallback_corrected_plan(
         {
             "step": "Produce deterministic fallback summary",
             "tool": "pandas",
-            "action": "result = {'summary': 'Fallback plan after critic validation'}",
+            "action": json.dumps({"operation": "memory_records", "limit": 5}),
         }
     ]
 

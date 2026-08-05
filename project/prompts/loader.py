@@ -24,4 +24,4 @@ def render_prompt(template_name: str, **kwargs: Any) -> str:
     """Render a prompt template with keyword substitutions."""
     template_text = load_prompt_template(template_name)
     values = {key: str(value) for key, value in kwargs.items()}
-    return Template(template_text).safe_substitute(values)
+    return Template(template_text).substitute(values)

@@ -4,7 +4,10 @@ from typing import Literal
 
 from langchain_groq import ChatGroq
 
-from config import Settings, get_settings
+try:
+    from config import Settings, get_settings
+except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
+    from project.config import Settings, get_settings
 
 GroqModel = Literal[
     "openai/gpt-oss-20b",

@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import ast
-import multiprocessing as mp
+import json
 import re
-import signal
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -24,75 +21,9 @@ _PLOT_FILE_RE = re.compile(
     r"^(?:[a-f0-9]{32}_step_\d{2}_[a-z0-9_-]+|step_\d{2}_[a-z0-9_-]+)\.png$"
 )
 _PLOT_RETENTION_SECONDS = 60 * 60
-_DEFAULT_PANDAS_TIMEOUT_SECONDS = 10.0
-
-
-_BLOCKED_NODES = (
-    ast.Import,
-    ast.ImportFrom,
-    ast.FunctionDef,
-    ast.AsyncFunctionDef,
-    ast.ClassDef,
-    ast.Global,
-    ast.Nonlocal,
-    ast.With,
-    ast.AsyncWith,
-    ast.Try,
-    ast.Raise,
-    ast.While,
-    ast.For,
-    ast.AsyncFor,
-)
-
-_BLOCKED_NAMES = {
-    "__import__",
-    "breakpoint",
-    "compile",
-    "delattr",
-    "dir",
-    "eval",
-    "exec",
-    "getattr",
-    "globals",
-    "help",
-    "input",
-    "locals",
-    "open",
-    "os",
-    "pathlib",
-    "setattr",
-    "shutil",
-    "socket",
-    "subprocess",
-    "sys",
-    "vars",
-}
-
-_SAFE_BUILTINS = {
-    "abs": abs,
-    "all": all,
-    "any": any,
-    "bool": bool,
-    "dict": dict,
-    "enumerate": enumerate,
-    "filter": filter,
-    "float": float,
-    "int": int,
-    "len": len,
-    "list": list,
-    "map": map,
-    "max": max,
-    "min": min,
-    "range": range,
-    "reversed": reversed,
-    "round": round,
-    "set": set,
-    "sorted": sorted,
-    "str": str,
-    "sum": sum,
-    "tuple": tuple,
-    "zip": zip,
-}
+_MAX_RESULT_ROWS = 1_000
+_ALLOWED_AGGREGATIONS = {"sum", "mean", "median", "min", "max", "count", "nunique"}
+_ALLOWED_FILTER_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte", "contains", "in"}
 
 try:
     import seaborn as sns
@@ -106,6 +37,9 @@ def _pick_chart_type(action: str) -> str:
     """Infer chart type from planner action text and data patterns."""
     lowered = action.lower()
     
+    if not lowered.strip() or lowered.strip() == "auto":
+        return "auto"
+
     chart_keywords = {
         "scatter": "scatter",
         "bubble": "bubble",
@@ -130,7 +64,7 @@ def _pick_chart_type(action: str) -> str:
         if keyword in lowered:
             return chart_type
     
-    return "line"
+    return "auto"
 
 
 def _best_chart_for_data(df: pd.DataFrame) -> str:
@@ -152,16 +86,16 @@ def _best_chart_for_data(df: pd.DataFrame) -> str:
             return "heatmap"
         return "box"
     
-    if len(numeric_cols) == 1:
-        if num_rows > 30:
-            return "kde"
-        return "hist"
-    
-    if len(categorical_cols) >= 1 and len(numeric_cols) >= 1:
+    if len(numeric_cols) == 1 and categorical_cols:
         cardinality = df[categorical_cols[0]].nunique()
         if cardinality <= 5:
             return "pie"
         return "bar"
+
+    if len(numeric_cols) == 1:
+        if num_rows > 30:
+            return "kde"
+        return "hist"
     
     return "line"
 
@@ -272,82 +206,119 @@ def _render_line(df: pd.DataFrame, ax: Any, title: str, numeric_cols: list[str])
         df.reset_index().plot(kind="line", x="index", y=df.columns[0], ax=ax, title=title)
 
 
-class PandasExecutionTimeoutError(TimeoutError):
-    """Raised when untrusted pandas code exceeds the allowed execution time."""
-
-
-def _execute_pandas_code(code: str, df: pd.DataFrame) -> Any:
-    """Validate and execute pandas code, returning the `result` variable."""
-    tree = _validate_pandas_code(code)
-
-    local_scope: dict[str, Any] = {"df": df.copy(deep=True)}
-    global_scope: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS, "pd": pd}
-
-    try:
-        compiled = compile(tree, filename="<pandas_tool>", mode="exec")
-        exec(compiled, global_scope, local_scope)
-    except Exception as exc:  # pragma: no cover - passthrough wrapper
-        raise RuntimeError(f"Failed to execute pandas code: {exc}") from exc
-
-    if "result" not in local_scope:
-        raise ValueError(
-            "Code must assign the final output to a variable named 'result'."
-        )
-
-    return local_scope["result"]
-
-
-def _execute_pandas_code_worker(code: str, df: pd.DataFrame, result_queue: mp.Queue) -> None:
-    """Run pandas code in a helper process and return the serialized outcome."""
-    try:
-        result_queue.put(("ok", _execute_pandas_code(code, df)))
-    except Exception as exc:
-        result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
-
-
-def _run_pandas_code_with_timeout(code: str, df: pd.DataFrame, timeout_seconds: float) -> Any:
-    """Execute pandas code with a wall-clock timeout."""
-    if timeout_seconds <= 0:
-        return _execute_pandas_code(code, df)
-
-    if hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer") and sys.platform != "win32":
-        def _handle_timeout(signum: int, frame: Any) -> None:
-            raise PandasExecutionTimeoutError(
-                f"Pandas execution exceeded {timeout_seconds}s and was aborted"
-            )
-
-        previous_handler = signal.getsignal(signal.SIGALRM)
-        signal.signal(signal.SIGALRM, _handle_timeout)
-        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+def _parse_operation(action: str | dict[str, Any]) -> dict[str, Any]:
+    """Parse a declarative pandas operation without evaluating source code."""
+    if isinstance(action, dict):
+        operation = action
+    elif isinstance(action, str) and action.strip():
         try:
-            return _execute_pandas_code(code, df)
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous_handler)
+            operation = json.loads(action)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Pandas action must be a JSON operation object.") from exc
+    else:
+        raise ValueError("Pandas action must be a non-empty JSON object.")
 
-    # Windows does not provide SIGALRM, so we fall back to a helper process and
-    # terminate it if the execution overruns the timeout.
-    context = mp.get_context("spawn")
-    result_queue: mp.Queue = context.Queue()
-    process = context.Process(target=_execute_pandas_code_worker, args=(code, df, result_queue))
-    process.start()
-    process.join(timeout_seconds)
+    if not isinstance(operation, dict) or not isinstance(operation.get("operation"), str):
+        raise ValueError("Pandas action requires a string 'operation' field.")
+    return operation
 
-    if process.is_alive():
-        process.terminate()
-        process.join()
-        raise PandasExecutionTimeoutError(
-            f"Pandas execution exceeded {timeout_seconds}s and was aborted"
+
+def _require_columns(df: pd.DataFrame, columns: list[Any]) -> list[str]:
+    """Validate requested columns against the current DataFrame."""
+    requested = [str(column) for column in columns]
+    missing = [column for column in requested if column not in df.columns]
+    if missing:
+        raise ValueError(f"Unknown DataFrame columns: {', '.join(missing)}")
+    return requested
+
+
+def _bounded_limit(value: Any, default: int = 20) -> int:
+    """Return a positive result limit capped to the application maximum."""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = default
+    return min(max(limit, 1), _MAX_RESULT_ROWS)
+
+
+def _filter_dataframe(df: pd.DataFrame, operation: dict[str, Any]) -> pd.DataFrame:
+    """Apply one validated column filter."""
+    column = _require_columns(df, [operation.get("column")])[0]
+    operator = str(operation.get("operator", "eq")).lower()
+    if operator not in _ALLOWED_FILTER_OPERATORS:
+        raise ValueError(f"Unsupported filter operator: {operator}")
+
+    value = operation.get("value")
+    series = df[column]
+    masks = {
+        "eq": lambda: series.eq(value),
+        "ne": lambda: series.ne(value),
+        "gt": lambda: series.gt(value),
+        "gte": lambda: series.ge(value),
+        "lt": lambda: series.lt(value),
+        "lte": lambda: series.le(value),
+        "contains": lambda: series.astype("string").str.contains(str(value), case=False, regex=False, na=False),
+        "in": lambda: series.isin(value if isinstance(value, list) else [value]),
+    }
+    return df.loc[masks[operator]()].head(_MAX_RESULT_ROWS).copy()
+
+
+def run_pandas_code(action: str | dict[str, Any], df: pd.DataFrame) -> Any:
+    """Execute one closed, declarative pandas operation.
+
+    The historical function name is retained for callers, but Python source is
+    never compiled or executed.
+    """
+    spec = _parse_operation(action)
+    operation = spec["operation"].strip().lower()
+    working = df.copy(deep=True)
+
+    if operation == "head":
+        return working.head(_bounded_limit(spec.get("limit")))
+    if operation == "select":
+        columns = _require_columns(working, spec.get("columns", []))
+        return working.loc[:, columns].head(_bounded_limit(spec.get("limit"), _MAX_RESULT_ROWS))
+    if operation == "describe":
+        columns = _require_columns(working, spec.get("columns", list(working.columns)))
+        return working.loc[:, columns].describe(include="all").reset_index()
+    if operation == "filter":
+        return _filter_dataframe(working, spec)
+    if operation == "sort":
+        columns = _require_columns(working, spec.get("by", []))
+        if not columns:
+            raise ValueError("Sort requires at least one column.")
+        return working.sort_values(columns, ascending=bool(spec.get("ascending", True))).head(
+            _bounded_limit(spec.get("limit"), _MAX_RESULT_ROWS)
         )
+    if operation == "value_counts":
+        column = _require_columns(working, [spec.get("column")])[0]
+        return working[column].value_counts(dropna=False).rename("count").reset_index().head(
+            _bounded_limit(spec.get("limit"), _MAX_RESULT_ROWS)
+        )
+    if operation == "aggregate":
+        column = _require_columns(working, [spec.get("column")])[0]
+        function = str(spec.get("function", "")).lower()
+        if function not in _ALLOWED_AGGREGATIONS:
+            raise ValueError(f"Unsupported aggregation: {function}")
+        value = working[column].agg(function)
+        return pd.DataFrame([{"metric": function, "column": column, "value": value}])
+    if operation == "groupby":
+        by = _require_columns(working, spec.get("by", []))
+        column = _require_columns(working, [spec.get("column")])[0]
+        function = str(spec.get("function", "")).lower()
+        if not by or function not in _ALLOWED_AGGREGATIONS:
+            raise ValueError("Groupby requires columns and a supported aggregation.")
+        return working.groupby(by, dropna=False)[column].agg(function).reset_index().head(_MAX_RESULT_ROWS)
+    if operation == "correlation":
+        default_columns = list(working.select_dtypes(include="number").columns)
+        columns = _require_columns(working, spec.get("columns", default_columns))
+        if len(columns) < 2:
+            raise ValueError("Correlation requires at least two numeric columns.")
+        return working.loc[:, columns].corr(numeric_only=True)
+    if operation == "memory_records":
+        return working.head(_bounded_limit(spec.get("limit", 5)))
 
-    if result_queue.empty():
-        raise RuntimeError("Failed to execute pandas code: worker returned no result")
-
-    status, payload = result_queue.get()
-    if status == "ok":
-        return payload
-
-    raise RuntimeError(f"Failed to execute pandas code: {payload}")
+    raise ValueError(f"Unsupported pandas operation: {operation}")
 
 
 def cleanup_plot_files(max_age_seconds: int = _PLOT_RETENTION_SECONDS) -> int:
@@ -436,47 +407,3 @@ def generate_plot(
     }
 
 
-def _validate_pandas_code(code: str) -> ast.Module:
-    """Parse and validate user code before execution."""
-    try:
-        tree = ast.parse(code, mode="exec")
-    except SyntaxError as exc:
-        raise ValueError(f"Invalid pandas code: {exc.msg}") from exc
-
-    for node in ast.walk(tree):
-        if isinstance(node, _BLOCKED_NODES):
-            raise ValueError(
-                f"Unsupported statement in pandas code: {type(node).__name__}"
-            )
-
-        if isinstance(node, ast.Name) and node.id in _BLOCKED_NAMES:
-            raise ValueError(f"Blocked name used in pandas code: {node.id}")
-
-        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-            raise ValueError("Dunder attribute access is not allowed.")
-
-    return tree
-
-
-def run_pandas_code(code: str, df: pd.DataFrame) -> Any:
-    """Run constrained pandas code and return the `result` variable."""
-    if not code or not code.strip():
-        raise ValueError("Code cannot be empty.")
-
-    tree = _validate_pandas_code(code)
-
-    local_scope: dict[str, Any] = {"df": df.copy(deep=True)}
-    global_scope: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS, "pd": pd}
-
-    try:
-        compiled = compile(tree, filename="<pandas_tool>", mode="exec")
-        exec(compiled, global_scope, local_scope)
-    except Exception as exc:  # pragma: no cover - passthrough wrapper
-        raise RuntimeError(f"Failed to execute pandas code: {exc}") from exc
-
-    if "result" not in local_scope:
-        raise ValueError(
-            "Code must assign the final output to a variable named 'result'."
-        )
-
-    return local_scope["result"]

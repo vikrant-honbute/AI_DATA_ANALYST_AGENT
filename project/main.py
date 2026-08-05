@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
-from graph import build_workflow
-from graph.state import AgentState
-from config import get_settings
+import os
+import sys
+from uuid import uuid4
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from graph import build_workflow
+    from graph.state import AgentState
+    from config import get_settings
+    from tools.pandas_tool import cleanup_plot_files
+except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
+    from project.graph import build_workflow
+    from project.graph.state import AgentState
+    from project.config import get_settings
+    from project.tools.pandas_tool import cleanup_plot_files
 
 
 def _build_initial_state(query: str) -> AgentState:
@@ -18,6 +31,7 @@ def _build_initial_state(query: str) -> AgentState:
         "insights": "",
         "memory": [],
         "retry_count": 0,
+        "session_id": uuid4().hex,
     }
 
 
@@ -39,6 +53,7 @@ def _extract_result(final_state: AgentState) -> str:
 def main() -> None:
     """Read a user query, run the graph, and print result + insights."""
     _ = get_settings()
+    cleanup_plot_files()
     app = build_workflow()
 
     query = input("Enter your analysis query: ").strip()

@@ -17,11 +17,24 @@ Rules:
 - corrected steps must remain deterministic and executable without LLM.
 - If data_source is csv, do not use sql tool.
 - If data_source is csv, dataframe is already available as variable df.
-- Never use pd.read_csv/read_excel/read_parquet/read_json in corrected pandas steps.
+- Do not use pd.read_csv/read_excel/read_parquet/read_json or any file operations in corrected pandas steps.
 - For csv workflows, use only columns listed in CSV columns.
 - Avoid duplicate retry steps unless each has a unique purpose.
 - When suggesting visualization retries, consider: scatter, bubble, box, violin, heatmap, area, pie, kde, hist, bar, line.
 - Pick chart types based on data: use scatter/bubble for relationships, box/violin for distributions, pie for proportions, bar for categories, line for trends.
+
+Pandas corrected actions are declarative JSON operation objects, never Python code.
+Supported pandas operations (use only these):
+- {"operation": "head", "limit": <int>}
+- {"operation": "select", "columns": ["col1", ...], "limit": <int>}
+- {"operation": "filter", "column": "col", "operator": "eq|ne|gt|gte|lt|lte|contains|in", "value": <value>}
+- {"operation": "sort", "by": ["col"], "ascending": true|false, "limit": <int>}
+- {"operation": "value_counts", "column": "col", "limit": <int>}
+- {"operation": "aggregate", "column": "col", "function": "sum|mean|median|min|max|count|nunique"}
+- {"operation": "groupby", "by": ["cat_col"], "column": "metric_col", "function": "sum|mean|median|min|max|count|nunique"}
+- {"operation": "correlation", "columns": ["col1", "col2"]}
+- {"operation": "memory_records", "limit": <int>} (mongo only)
+For visualization steps, action is plain chart-description text.
 
 Current plan: $serialized_plan
 Intermediate results: $serialized_results

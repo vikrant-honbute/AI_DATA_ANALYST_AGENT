@@ -29,11 +29,25 @@ Rules:
 - If needed fields are unavailable, choose closest valid columns and note limits in action.
 - If data_source is csv, do not use sql tool. Use pandas and visualization only.
 - For csv workflows, the uploaded file is already loaded into pandas DataFrame variable df.
-- Never call pd.read_csv, read_excel, read_parquet, read_json, or read local files in pandas actions.
+- Do not use pd.read_csv, read_excel, read_parquet, read_json, or any file operations.
 - If CSV columns context is available, use only those columns in pandas actions.
 - If data_source is mongo, do not use sql tool.
 - If use_memory_context is true and memory context is available, include an early step that reuses memory for comparison/reference.
 - Memory-reuse steps must remain executable using allowed tools.
+
+Pandas actions are declarative JSON operation objects, never Python code.
+Supported pandas operations and their fields (use only these):
+- {"operation": "head", "limit": <int>} — preview first rows.
+- {"operation": "select", "columns": ["col1", ...], "limit": <int>} — pick columns.
+- {"operation": "filter", "column": "col", "operator": "eq|ne|gt|gte|lt|lte|contains|in", "value": <value>} — filter rows (use "in" with a list).
+- {"operation": "sort", "by": ["col"], "ascending": true|false, "limit": <int>} — sort rows.
+- {"operation": "value_counts", "column": "col", "limit": <int>} — frequency counts.
+- {"operation": "aggregate", "column": "col", "function": "sum|mean|median|min|max|count|nunique"} — single-number metric.
+- {"operation": "groupby", "by": ["cat_col"], "column": "metric_col", "function": "sum|mean|median|min|max|count|nunique"} — grouped totals.
+- {"operation": "correlation", "columns": ["col1", "col2"]} — numeric correlation matrix.
+- {"operation": "memory_records", "limit": <int>} — show prior memory context rows (mongo only).
+For visualization steps, action is plain text describing the chart (e.g., "Create a bar chart of revenue by region").
+The executor will reject any pandas action that is not one of the objects above.
 
 Chart Type Guidance (use diverse visualizations):
 - scatter/bubble: For comparing 2+ numeric variables or identifying relationships.

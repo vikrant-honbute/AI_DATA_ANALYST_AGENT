@@ -27,6 +27,7 @@ class AgentState(TypedDict):
     insights: str
     memory: list[Any]
     run_id: NotRequired[str]
+    session_id: NotRequired[str]
     uploaded_dataframe: NotRequired[Any]
     final_output: NotRequired[FinalOutput]
     retry: NotRequired[bool]

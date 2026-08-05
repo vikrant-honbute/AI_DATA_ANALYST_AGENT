@@ -17,6 +17,10 @@ _FORBIDDEN_TOKENS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|MERGE|CALL|EXEC|EXECUTE|COPY)\b",
     re.IGNORECASE,
 )
+_FORBIDDEN_FUNCTIONS = re.compile(
+    r"\b(?:pg_sleep|nextval|setval|currval|dblink|lo_import|lo_export|pg_read_file|pg_write_file)\s*\(",
+    re.IGNORECASE,
+)
 
 
 def _validate_safe_query(query: str) -> str:
@@ -34,6 +38,8 @@ def _validate_safe_query(query: str) -> str:
         raise ValueError("Only read-only SELECT/with queries are allowed.")
     if _FORBIDDEN_TOKENS.search(normalized):
         raise ValueError("Potentially unsafe SQL keyword detected.")
+    if _FORBIDDEN_FUNCTIONS.search(normalized):
+        raise ValueError("Potentially unsafe SQL function detected.")
 
     return normalized
 
@@ -49,7 +55,21 @@ def query_postgres(query: str) -> pd.DataFrame:
 
     try:
         with engine.connect() as connection:
-            return pd.read_sql_query(text(safe_query), connection)
+            with connection.begin():
+                connection.execute(text("SET TRANSACTION READ ONLY"))
+                connection.execute(
+                    text("SET LOCAL statement_timeout = :timeout"),
+                    {"timeout": max(settings.postgres_statement_timeout_ms, 1)},
+                )
+                connection.execute(text("SET LOCAL lock_timeout = '2s'"))
+                result = connection.execute(text(safe_query))
+                rows = result.fetchmany(max(settings.postgres_max_rows, 1) + 1)
+                columns = list(result.keys())
+                if len(rows) > settings.postgres_max_rows:
+                    raise ValueError(
+                        f"Query returned more than {settings.postgres_max_rows} rows. Add a LIMIT clause."
+                    )
+                return pd.DataFrame(rows, columns=columns)
     finally:
         engine.dispose()
 
@@ -66,14 +86,16 @@ def fetch_postgres_schema() -> dict[str, list[str]]:
         inspector = inspect(engine)
         schema_map: dict[str, list[str]] = {}
 
-        for table_name in inspector.get_table_names():
-            columns = inspector.get_columns(table_name)
-            column_names = [
-                str(column.get("name", "")).strip()
-                for column in columns
-                if str(column.get("name", "")).strip()
-            ]
-            schema_map[table_name] = column_names
+        for schema_name in settings.allowed_postgres_schemas:
+            for table_name in inspector.get_table_names(schema=schema_name):
+                columns = inspector.get_columns(table_name, schema=schema_name)
+                qualified_name = f"{schema_name}.{table_name}"
+                column_names = [
+                    str(column.get("name", "")).strip()
+                    for column in columns
+                    if str(column.get("name", "")).strip()
+                ]
+                schema_map[qualified_name] = column_names
 
         return schema_map
     finally:

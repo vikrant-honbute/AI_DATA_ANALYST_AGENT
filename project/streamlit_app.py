@@ -6,14 +6,22 @@ import logging
 from pathlib import Path
 import re
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from config import get_settings
-from graph import build_workflow
-from graph.state import AgentState
+try:
+    from config import get_settings
+    from graph import build_workflow
+    from graph.state import AgentState
+    from tools.pandas_tool import cleanup_plot_files
+except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
+    from project.config import get_settings
+    from project.graph import build_workflow
+    from project.graph.state import AgentState
+    from project.tools.pandas_tool import cleanup_plot_files
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +45,9 @@ _PLOTLY_CHART_HEIGHT = 420
 _PLOTLY_FONT = "Inter, -apple-system, 'Segoe UI', Roboto, sans-serif"
 
 
-def _build_initial_state(query: str, uploaded_df: pd.DataFrame | None) -> AgentState:
+def _build_initial_state(
+    query: str, uploaded_df: pd.DataFrame | None, session_id: str = ""
+) -> AgentState:
     """Build the graph state from UI inputs."""
     state: AgentState = {
         "query": query,
@@ -48,6 +58,7 @@ def _build_initial_state(query: str, uploaded_df: pd.DataFrame | None) -> AgentS
         "insights": "",
         "memory": [],
         "retry_count": 0,
+        "session_id": session_id,
     }
 
     if uploaded_df is not None:
@@ -221,7 +232,8 @@ def _result_to_dataframe(result: Any) -> pd.DataFrame | None:
         return result.copy(deep=True)
 
     if isinstance(result, pd.Series):
-        return result.to_frame().T.reset_index(drop=True)
+        value_name = str(result.name) if result.name is not None else "value"
+        return result.rename(value_name).reset_index()
 
     return None
 
@@ -307,6 +319,24 @@ def _html_escape(text: str) -> str:
     )
 
 
+def _compute_trend(series: pd.Series) -> str:
+    """Classify a series trend using monotonic agreement, not just endpoints."""
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if len(values) < 2 or float(values.std()) == 0:
+        return "stable"
+
+    x = np.arange(len(values))
+    correlation = float(np.corrcoef(x, values)[0, 1])
+    first = float(values.iloc[0])
+    relative_change = (float(values.iloc[-1]) - first) / max(abs(first), 1e-9)
+
+    if correlation >= 0.5 and relative_change >= 0.05:
+        return "rising"
+    if correlation <= -0.5 and relative_change <= -0.05:
+        return "declining"
+    return "mixed"
+
+
 def _analyze_chart_data(chart: dict[str, Any], source_df: pd.DataFrame | None) -> dict[str, Any]:
     """Compute KPI cards and numeric facts for a chart from its source data."""
     empty = {"kpis": [], "mode": "none", "metric_label": "", "group_label": ""}
@@ -363,7 +393,7 @@ def _analyze_chart_data(chart: dict[str, Any], source_df: pd.DataFrame | None) -
             "worst_name": _prettify_name(y_col),
             "worst_value": _format_compact(y_series.min()),
             "avg_value": _format_compact(y_series.mean()),
-            "trend": "rising" if y_series.iloc[-1] > y_series.iloc[0] else "declining",
+            "trend": _compute_trend(y_series),
         }
 
     if chart_type in {"line", "area"} and numeric_cols:
@@ -408,7 +438,7 @@ def _analyze_chart_data(chart: dict[str, Any], source_df: pd.DataFrame | None) -
                 "worst_name": "Trough",
                 "worst_value": worst_value,
                 "avg_value": avg_value,
-                "trend": "rising" if series.iloc[-1] > series.iloc[0] else "declining",
+                "trend": _compute_trend(series),
             }
 
     if categorical_cols and numeric_cols:
@@ -511,7 +541,7 @@ def _analyze_chart_data(chart: dict[str, Any], source_df: pd.DataFrame | None) -
                 "worst_name": "Trough",
                 "worst_value": worst_value,
                 "avg_value": avg_value,
-                "trend": "rising" if series.iloc[-1] > series.iloc[0] else "declining",
+                "trend": _compute_trend(series),
             }
 
     if categorical_cols:
@@ -594,7 +624,7 @@ def _chart_title_and_subtitle(chart: dict[str, Any], analysis: dict[str, Any]) -
 
 
 def _build_business_insight(chart: dict[str, Any], analysis: dict[str, Any]) -> str:
-    """Compose a senior-business-analyst style narrative from computed facts."""
+    """Compose a descriptive summary of computed facts without causal claims."""
     mode = analysis.get("mode", "none")
     metric = analysis.get("metric_label", "")
     money_prefix = "$" if _looks_like_money(metric) else ""
@@ -608,12 +638,13 @@ def _build_business_insight(chart: dict[str, Any], analysis: dict[str, Any]) -> 
         worst_v = f"{money_prefix}{_format_compact(analysis['worst_value'])}"
         avg_v = f"{money_prefix}{_format_compact(analysis['avg_value'])}"
         paragraphs = [
-            f"{best} is the strongest performer, reaching {best_v} — approximately {share:.0f}% of total "
-            f"{metric.lower()}. This makes it the clear growth engine of the portfolio.",
-            f"{worst} trails significantly at {worst_v}, pointing to an opportunity to investigate the drivers "
-            f"behind its underperformance and unlock untapped potential.",
-            f"Across the {n} segments, the average is {avg_v}, providing a solid baseline for setting realistic "
-            f"targets and tracking performance over time.",
+            f"'{best}' shows the highest observed total for {metric.lower()} at {best_v}, "
+            f"approximately {share:.0f}% of the group total. This reflects the observed "
+            f"distribution; it does not identify why the gap exists.",
+            f"'{worst}' shows the lowest observed total at {worst_v}. A deeper review of the "
+            f"underlying records would be needed to interpret this difference.",
+            f"Across the {n} segments, the observed average is {avg_v}. Aggregation choices, "
+            f"sample sizes, and missing data can influence these values.",
         ]
         return "\n\n".join(paragraphs)
 
@@ -623,18 +654,26 @@ def _build_business_insight(chart: dict[str, Any], analysis: dict[str, Any]) -> 
         avg_v = f"{money_prefix}{_format_compact(analysis['avg_value'])}"
         trend = analysis.get("trend", "stable")
         paragraphs = [
-            f"The metric peaked at {best_v} and dipped to {worst_v} over the analyzed period.",
-            f"The overall trend shows {'an upward trajectory' if trend == 'rising' else 'a downward trajectory'}, "
+            f"The metric peaked at {best_v} and dipped to {worst_v} over the analyzed period, "
             f"with an average of {avg_v} across all observations.",
         ]
         if trend == "rising":
             paragraphs.append(
-                "Sustaining this momentum should remain a top priority for the coming periods."
+                "The values trend upward in the observed period. This is a descriptive pattern; "
+                "confirm the time ordering and external factors before drawing conclusions."
+            )
+        elif trend == "declining":
+            paragraphs.append(
+                "The values trend downward in the observed period. This is a descriptive pattern; "
+                "confirm the time ordering and external factors before drawing conclusions."
+            )
+        elif trend == "mixed":
+            paragraphs.append(
+                "The values do not follow a single consistent direction, so no clear upward or "
+                "downward trend is supported by the data."
             )
         else:
-            paragraphs.append(
-                "Reverse engineering the periods of decline will be essential to stabilize performance."
-            )
+            paragraphs.append("The values are relatively stable across the observed period.")
         return "\n\n".join(paragraphs)
 
     if mode == "counts":
@@ -644,58 +683,59 @@ def _build_business_insight(chart: dict[str, Any], analysis: dict[str, Any]) -> 
         worst_v = f"{analysis['worst_value']:,}"
         avg_v = f"{analysis['avg_value']:,.1f}"
         paragraphs = [
-            f"'{best}' dominates the dataset with {best_v} occurrences, making it the clear focus of the data.",
-            f"'{worst}' appears only {worst_v} times, suggesting a segment that may be underserved or underexplored.",
-            f"On average, each category appears {avg_v} times, which helps calibrate expectations for future sampling.",
+            f"'{best}' appears most often in the dataset with {best_v} occurrences.",
+            f"'{worst}' appears least often with {worst_v} occurrences.",
+            f"On average, each category appears {avg_v} times in the current data.",
         ]
         return "\n\n".join(paragraphs)
 
     return (
-        "The visualization provides a clear overview of the dataset, highlighting the distribution and "
-        "key patterns across the analyzed fields. No single metric dominates, so decisions should weigh "
-        "multiple dimensions before committing resources."
+        "The visualization summarizes the observed distribution of the analyzed fields. "
+        "No single metric dominates, so conclusions should weigh multiple dimensions and "
+        "account for sample sizes and missing values."
     )
 
 
 def _build_recommendations(chart: dict[str, Any], analysis: dict[str, Any]) -> list[str]:
-    """Generate concise, actionable recommendations from the analysis."""
+    """Generate descriptive follow-up suggestions without causal claims."""
     mode = analysis.get("mode", "none")
 
     if mode == "categorical":
         best = analysis["best_name"]
         worst = analysis["worst_name"]
         return [
-            f"Increase investment in {best}, the highest-performing segment.",
-            f"Investigate why {worst} underperforms and build a corrective plan.",
-            f"Replicate the success factors of {best} across other segments.",
-            "Revisit pricing and operations to close the gap between top and bottom performers.",
+            f"Inspect the records behind '{best}' to understand what explains its higher total.",
+            f"Review the records behind '{worst}' to check for missing data or structural reasons.",
+            "Compare segment sample sizes before treating the totals as performance differences.",
         ]
 
     if mode == "series":
         if analysis.get("trend") == "rising":
             return [
-                "Capitalize on the upward trend by scaling the initiatives behind this metric.",
-                "Set stretch targets to lock in the current growth momentum.",
-                "Monitor the metric for early signs of slowdown in the coming periods.",
+                "Verify that the data is correctly ordered by time before acting on the upward pattern.",
+                "Track the metric over a longer window to confirm the direction persists.",
+            ]
+        if analysis.get("trend") == "declining":
+            return [
+                "Verify that the data is correctly ordered by time before acting on the downward pattern.",
+                "Check for missing or anomalous observations in the declining periods.",
             ]
         return [
-            "Develop a mitigation plan to reverse the downward trend.",
-            "Identify the periods driving the decline and investigate their root causes.",
-            "Introduce a closer monitoring cadence until the metric stabilizes.",
+            "The trend direction is not clear from the current data; inspect the time series ordering.",
+            "Gather more observations before concluding there is a stable pattern.",
         ]
 
     if mode == "counts":
         best = analysis["best_name"]
         worst = analysis["worst_name"]
         return [
-            f"Deep-dive into what drives the popularity of '{best}'.",
-            f"Explore ways to lift engagement with '{worst}'.",
-            "Use segment-level feedback to guide the next iteration of the strategy.",
+            f"Review the definition and coverage of '{best}' before treating it as a priority.",
+            f"Check whether '{worst}' is under-represented in the data or genuinely rare.",
         ]
 
     return [
-        "Focus on the metrics with the highest business impact first.",
-        "Establish a monitoring cadence to track changes over time.",
+        "Review the distribution and coverage of the analyzed fields.",
+        "Consider a longer or wider dataset before making decisions.",
     ]
 
 def _render_kpi_cards(kpis: list[dict[str, str]]) -> None:
@@ -1391,24 +1431,44 @@ def _render_chart_section(chart: dict[str, Any], step_results: list[dict[str, An
     st.markdown('<hr class="ada-divider"/>', unsafe_allow_html=True)
 
 
-_CSV_ENCODING_FALLBACKS = ("utf-8", "utf-8-sig", "gb18030", "cp1252", "latin-1")
-
-
 def _read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
-    """Read an uploaded CSV, retrying with common encodings when UTF-8 fails."""
-    last_error: Exception | None = None
+    """Read an uploaded CSV with size, row, and column limits enforced."""
+    settings = get_settings()
 
-    for encoding in _CSV_ENCODING_FALLBACKS:
+    file_size = getattr(uploaded_file, "size", 0)
+    if file_size and file_size > settings.max_csv_bytes:
+        raise ValueError(
+            f"Uploaded CSV is {file_size / (1024 * 1024):.1f} MB, exceeding the "
+            f"{settings.max_csv_bytes / (1024 * 1024):.0f} MB limit."
+        )
+
+    last_error: Exception | None = None
+    for encoding in ("utf-8", "utf-8-sig", "gb18030", "cp1252"):
         try:
             uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding=encoding)
+            frame = pd.read_csv(uploaded_file, encoding=encoding)
+            break
         except (UnicodeDecodeError, pd.errors.ParserError) as exc:
             last_error = exc
+    else:
+        if last_error is not None:
+            raise ValueError(
+                "Could not read the CSV with common text encodings. "
+                "Upload a UTF-8 encoded CSV file."
+            ) from last_error
+        frame = pd.read_csv(uploaded_file)
 
-    if last_error is not None:
-        raise last_error
-
-    return pd.read_csv(uploaded_file)
+    if len(frame) > settings.max_csv_rows:
+        raise ValueError(
+            f"Uploaded CSV has {len(frame):,} rows, exceeding the "
+            f"{settings.max_csv_rows:,} row limit."
+        )
+    if len(frame.columns) > settings.max_csv_columns:
+        raise ValueError(
+            f"Uploaded CSV has {len(frame.columns)} columns, exceeding the "
+            f"{settings.max_csv_columns} column limit."
+        )
+    return frame
 
 
 _PREMIUM_CSS = """
@@ -1693,6 +1753,7 @@ def _json_safe(value: Any) -> Any:
 def _get_compiled_graph():
     """Build and cache the compiled LangGraph application."""
     _ = get_settings()
+    cleanup_plot_files()
     return build_workflow()
 
 
@@ -1730,13 +1791,17 @@ def main() -> None:
         st.session_state["final_state"] = None
     if "last_query" not in st.session_state:
         st.session_state["last_query"] = ""
+    if "ada_session_id" not in st.session_state:
+        st.session_state["ada_session_id"] = uuid4().hex
 
     if run_clicked:
         if not query.strip():
             st.warning("Please enter a query before running analysis.")
         else:
             app = _get_compiled_graph()
-            initial_state = _build_initial_state(query.strip(), uploaded_df)
+            initial_state = _build_initial_state(
+                query.strip(), uploaded_df, session_id=st.session_state["ada_session_id"]
+            )
 
             with st.spinner("Running workflow..."):
                 try:
