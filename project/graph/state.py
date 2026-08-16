@@ -32,3 +32,6 @@ class AgentState(TypedDict):
     final_output: NotRequired[FinalOutput]
     retry: NotRequired[bool]
     retry_count: NotRequired[int]
+    dashboard: NotRequired[bool]
+    dashboard_spec: NotRequired[dict[str, Any]]
+    last_execution_node: NotRequired[str]

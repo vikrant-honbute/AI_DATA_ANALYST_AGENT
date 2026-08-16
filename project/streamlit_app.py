@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import logging
 from pathlib import Path
 import re
 from typing import Any
 from uuid import uuid4
+import zipfile
 
 import numpy as np
 import pandas as pd
@@ -14,11 +18,15 @@ import streamlit as st
 
 try:
     from config import get_settings
+    from dashboard.charts import build_figure_for_chart
+    from dashboard.spec import normalize_spec as normalize_dashboard_spec
     from graph import build_workflow
     from graph.state import AgentState
     from tools.pandas_tool import cleanup_plot_files
 except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
     from project.config import get_settings
+    from project.dashboard.charts import build_figure_for_chart
+    from project.dashboard.spec import normalize_spec as normalize_dashboard_spec
     from project.graph import build_workflow
     from project.graph.state import AgentState
     from project.tools.pandas_tool import cleanup_plot_files
@@ -44,9 +52,14 @@ _PLOTLY_BLUE_PALETTE = (_PLOTLY_BLUE, _PLOTLY_BLUE_LIGHT, _PLOTLY_BLUE_PALE, "#7
 _PLOTLY_CHART_HEIGHT = 420
 _PLOTLY_FONT = "Inter, -apple-system, 'Segoe UI', Roboto, sans-serif"
 
+_DASHBOARD_DEFAULT_QUERY = (
+    "Build a full executive dashboard of this dataset: KPIs with period changes, "
+    "trend over time, top categories, distribution and correlations."
+)
+
 
 def _build_initial_state(
-    query: str, uploaded_df: pd.DataFrame | None, session_id: str = ""
+    query: str, uploaded_df: pd.DataFrame | None, session_id: str = "", dashboard: bool = False
 ) -> AgentState:
     """Build the graph state from UI inputs."""
     state: AgentState = {
@@ -63,6 +76,9 @@ def _build_initial_state(
 
     if uploaded_df is not None:
         state["uploaded_dataframe"] = uploaded_df.copy(deep=True)
+
+    if dashboard:
+        state["dashboard"] = True
 
     return state
 
@@ -1431,6 +1447,184 @@ def _render_chart_section(chart: dict[str, Any], step_results: list[dict[str, An
     st.markdown('<hr class="ada-divider"/>', unsafe_allow_html=True)
 
 
+def _build_kpi_csv(spec: dict[str, Any]) -> str:
+    """Build a CSV export of the dashboard KPI row."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["label", "value", "sub", "delta"])
+    for kpi in spec.get("kpis", []):
+        writer.writerow(
+            [
+                str(kpi.get("label", "")),
+                str(kpi.get("value", "")),
+                str(kpi.get("sub", "")),
+                str(kpi.get("delta") or ""),
+            ]
+        )
+    return buffer.getvalue()
+
+
+def _build_dashboard_chart_zip(spec: dict[str, Any]) -> bytes:
+    """Render each dashboard chart to PNG (kaleido) and pack them into a ZIP."""
+    buffer = io.BytesIO()
+    included = 0
+    try:
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for index, chart in enumerate(spec.get("charts", []), start=1):
+                figure = build_figure_for_chart(chart) if _PLOTLY_AVAILABLE else None
+                if figure is None:
+                    continue
+                png_bytes = figure.to_image(format="png", scale=2)
+                safe_id = re.sub(
+                    r"[^a-z0-9_-]+",
+                    "_",
+                    str(chart.get("chart_id", f"chart_{index}")).lower(),
+                )
+                archive.writestr(f"{index:02d}_{safe_id}.png", png_bytes)
+                included += 1
+    except Exception as exc:
+        logger.warning("Dashboard ZIP export failed: %s", exc)
+        return b""
+    return buffer.getvalue() if included else b""
+
+
+def _render_dashboard_section(spec: dict[str, Any]) -> None:
+    """Render the agent-built executive dashboard: KPIs, charts, narrative, exports."""
+    kpis = spec.get("kpis", [])
+    charts = spec.get("charts", [])
+    title = str(spec.get("title", "Executive Dashboard"))
+
+    st.markdown(
+        f'<div class="ada-chart-title">📊 {_html_escape(title)}</div>',
+        unsafe_allow_html=True,
+    )
+
+    meta_bits: list[str] = []
+    data_source = str(spec.get("data_source", "")).strip()
+    if data_source:
+        meta_bits.append(data_source.upper())
+    row_count = spec.get("row_count")
+    if isinstance(row_count, int):
+        meta_bits.append(f"{row_count:,} rows × {spec.get('column_count', '?')} columns")
+    time_range = spec.get("time_range")
+    if isinstance(time_range, dict) and time_range.get("start") and time_range.get("end"):
+        meta_bits.append(f"{time_range['start']} → {time_range['end']}")
+    generated = str(spec.get("generated_at", "")).replace("T", " ")[:16]
+    if generated:
+        meta_bits.append(f"Generated {generated}")
+
+    header_bits = [str(spec.get("subtitle", ""))]
+    header_bits = [bit for bit in header_bits if bit.strip()]
+    if meta_bits:
+        header_bits.append(" · ".join(meta_bits))
+    if header_bits:
+        st.markdown(
+            f'<div class="ada-chart-subtitle">{_html_escape(" · ".join(header_bits))}</div>',
+            unsafe_allow_html=True,
+        )
+
+    _render_kpi_cards(
+        [
+            {
+                "label": kpi.get("label", ""),
+                "icon": kpi.get("icon", "📊"),
+                "value": kpi.get("value", ""),
+                "sub": kpi.get("sub", ""),
+                "tone": kpi.get("tone", "neutral"),
+            }
+            for kpi in kpis
+        ]
+    )
+
+    for start in range(0, len(charts), 2):
+        row_charts = charts[start:start + 2]
+        cols = st.columns(2, gap="large")
+        for col, chart in zip(cols, row_charts):
+            with col:
+                st.markdown(
+                    f'<div class="ada-dash-chart-title">{_html_escape(chart.get("title", ""))}</div>',
+                    unsafe_allow_html=True,
+                )
+                chart_subtitle = str(chart.get("subtitle", ""))
+                if chart_subtitle:
+                    st.caption(chart_subtitle)
+                figure = build_figure_for_chart(chart) if _PLOTLY_AVAILABLE else None
+                if figure is None:
+                    st.warning(chart_subtitle or "Chart unavailable for this data shape.")
+                    continue
+                st.plotly_chart(
+                    figure,
+                    use_container_width=True,
+                    config={"displayModeBar": False, "responsive": True, "scrollZoom": False},
+                )
+                data_note = str(chart.get("data_note", ""))
+                if data_note:
+                    st.caption(data_note)
+
+    executive_summary = str(spec.get("executive_summary", "")).strip()
+    if executive_summary:
+        st.markdown(
+            '<div class="ada-card ada-insight">'
+            '<div class="ada-card-head">'
+            '<span class="ada-card-icon">📈</span>'
+            '<span class="ada-card-title">Executive Summary</span>'
+            "</div>"
+            f'<div class="ada-card-body"><p>{_html_escape(executive_summary)}</p></div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    for icon, card_title, bullets in (
+        ("💡", "Key Insights", spec.get("insights", [])),
+        ("🎯", "Recommended Next Steps", spec.get("recommendations", [])),
+    ):
+        if not bullets:
+            continue
+        items = "".join(f"<li>{_html_escape(str(item))}</li>" for item in bullets)
+        st.markdown(
+            '<div class="ada-card ada-insight">'
+            '<div class="ada-card-head">'
+            f'<span class="ada-card-icon">{icon}</span>'
+            f'<span class="ada-card-title">{card_title}</span>'
+            "</div>"
+            f'<div class="ada-card-body"><ul>{items}</ul></div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    export_key = f"{title}|{spec.get('generated_at', '')}|{len(charts)}"
+    if st.session_state.get("dashboard_export_key") != export_key:
+        st.session_state["dashboard_export_key"] = export_key
+        st.session_state["dashboard_export_zip"] = _build_dashboard_chart_zip(spec)
+
+    zip_bytes = st.session_state.get("dashboard_export_zip") or b""
+    export_cols = st.columns(3)
+    if zip_bytes:
+        export_cols[0].download_button(
+            "⬇️ Charts (ZIP · PNG)",
+            data=zip_bytes,
+            file_name="dashboard_charts.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+    export_cols[1].download_button(
+        "⬇️ KPI data (CSV)",
+        data=_build_kpi_csv(spec),
+        file_name="dashboard_kpis.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    export_cols[2].download_button(
+        "⬇️ Dashboard spec (JSON)",
+        data=json.dumps(spec, indent=2, ensure_ascii=False),
+        file_name="dashboard_spec.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    st.markdown('<hr class="ada-divider"/>', unsafe_allow_html=True)
+
+
 def _read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
     """Read an uploaded CSV with size, row, and column limits enforced."""
     settings = get_settings()
@@ -1714,6 +1908,26 @@ hr.ada-divider {
     from { opacity: 0; transform: translateY(12px); }
     to   { opacity: 1; transform: translateY(0); }
 }
+/* ---------- Dashboard section ---------- */
+
+.ada-dash-chart-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: #FFFFFF;
+    margin: 18px 0 4px 0;
+}
+
+.ada-dash-meta {
+    font-size: 13px;
+    color: #9CA3AF;
+    margin: 0 0 8px 0;
+}
+
+.ada-dash-section .stCaption {
+    color: #6B7280;
+    font-size: 12px;
+}
+
 </style>
 """
 
@@ -1785,7 +1999,9 @@ def main() -> None:
         height=120,
     )
 
-    run_clicked = st.button("Run Analysis", type="primary", use_container_width=True)
+    run_col, dashboard_col = st.columns([3, 2], gap="medium")
+    run_clicked = run_col.button("Run Analysis", type="primary", use_container_width=True)
+    dashboard_clicked = dashboard_col.button("📊 Build Dashboard", use_container_width=True)
 
     if "final_state" not in st.session_state:
         st.session_state["final_state"] = None
@@ -1794,16 +2010,20 @@ def main() -> None:
     if "ada_session_id" not in st.session_state:
         st.session_state["ada_session_id"] = uuid4().hex
 
-    if run_clicked:
-        if not query.strip():
+    if run_clicked or dashboard_clicked:
+        if dashboard_clicked:
+            effective_query = query.strip() or _DASHBOARD_DEFAULT_QUERY
+        else:
+            effective_query = query.strip()
+        if not effective_query:
             st.warning("Please enter a query before running analysis.")
         else:
             app = _get_compiled_graph()
             initial_state = _build_initial_state(
-                query.strip(), uploaded_df, session_id=st.session_state["ada_session_id"]
+                effective_query, uploaded_df, session_id=st.session_state["ada_session_id"], dashboard=dashboard_clicked
             )
 
-            with st.spinner("Running workflow..."):
+            with st.spinner("Building dashboard..." if dashboard_clicked else "Running workflow..."):
                 try:
                     final_state: AgentState = app.invoke(
                         initial_state,
@@ -1814,7 +2034,7 @@ def main() -> None:
                     return
 
             st.session_state["final_state"] = final_state
-            st.session_state["last_query"] = query.strip()
+            st.session_state["last_query"] = effective_query
 
     final_state = st.session_state.get("final_state")
     if not isinstance(final_state, dict):
@@ -1824,6 +2044,10 @@ def main() -> None:
     result = _extract_result(final_state)
     insights = _extract_insights(final_state)
     step_results = _extract_step_results(final_state)
+    dashboard_spec = final_state.get("dashboard_spec")
+    if isinstance(dashboard_spec, dict):
+        dashboard_spec = normalize_dashboard_spec(dashboard_spec) or dashboard_spec
+        _render_dashboard_section(dashboard_spec)
     chart_entries = _collect_chart_paths(step_results)
 
     raw_retry_count = final_state.get("retry_count", 0)
@@ -1884,7 +2108,10 @@ def main() -> None:
             for chart in chart_entries:
                 _render_chart_section(chart, step_results)
         else:
-            st.info("No charts generated for this run.")
+            if isinstance(final_state.get("dashboard_spec"), dict):
+                st.info("Interactive charts are rendered in the dashboard section above.")
+            else:
+                st.info("No charts generated for this run.")
 
     if explain_mode:
         st.subheader("Execution Trace")

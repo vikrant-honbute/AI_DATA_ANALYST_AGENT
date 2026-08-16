@@ -24,6 +24,8 @@ Rules:
 - Do not include any text before or after the JSON object.
 - For each step, tool must be one of: sql, pandas, visualization.
 - Set data_source exactly to the routed value above.
+- Set dashboard=true only when the user asks for a dashboard, overview, scorecard, or a broad multi-metric view of the dataset. Set dashboard=false for narrow single-metric questions.
+- When dashboard=true, keep steps minimal (the dashboard pipeline performs the analysis).
 - If data_source is postgres, use only tables and columns from schema context.
 - Never hallucinate missing tables or columns.
 - If needed fields are unavailable, choose closest valid columns and note limits in action.
@@ -66,7 +68,7 @@ Chart Type Guidance (use diverse visualizations):
 - If action suggests "correlation" → use heatmap.
 
 Use this exact schema:
-{"steps":[{"step":"description","tool":"sql | pandas | visualization","action":"what to do"}],"data_source":"postgres | csv | mongo","final_output":"table | chart | summary"}
+{"steps":[{"step":"description","tool":"sql | pandas | visualization","action":"what to do"}],"data_source":"postgres | csv | mongo","final_output":"table | chart | summary","dashboard":true | false}
 
 $format_instructions
 

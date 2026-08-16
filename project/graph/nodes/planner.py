@@ -43,6 +43,10 @@ class PlannerOutputModel(BaseModel):
     steps: list[PlannerStepModel] = Field(default_factory=list)
     data_source: DataSource = "csv"
     final_output: Literal["table", "chart", "summary"] = "summary"
+    dashboard: bool = Field(
+        default=False,
+        description="True when the user wants a full executive dashboard of the data.",
+    )
 
 
 _FILE_LOAD_MARKERS = (
@@ -53,6 +57,26 @@ _FILE_LOAD_MARKERS = (
     "read_table(",
     "read_pickle(",
 )
+
+_DASHBOARD_KEYWORDS = (
+    "dashboard",
+    "dash board",
+    "overview",
+    "executive summary",
+    "big picture",
+    "full picture",
+    "complete picture",
+    "high level view",
+    "high-level view",
+    "scorecard",
+    "kpi summary",
+)
+
+
+def _is_dashboard_request(query: str) -> bool:
+    """Return True when the query explicitly asks for a dashboard-style view."""
+    lowered = query.lower()
+    return any(keyword in lowered for keyword in _DASHBOARD_KEYWORDS)
 
 
 def _build_router_prompt(query: str, has_uploaded_csv: bool) -> str:
@@ -597,6 +621,9 @@ def planner_node(state: AgentState) -> AgentState:
     except Exception:
         parsed = _fallback_output(query, routed_data_source, csv_columns)
 
+    forced_dashboard = bool(state.get("dashboard", False))
+    dashboard = bool(parsed.dashboard) or forced_dashboard or _is_dashboard_request(query)
+
     plan = [
         {
             "step": item.step,
@@ -627,4 +654,5 @@ def planner_node(state: AgentState) -> AgentState:
         "data_source": routed_data_source,
         "final_output": parsed.final_output,
         "memory": recent_memory,
+        "dashboard": dashboard,
     }

@@ -189,6 +189,7 @@ def executor_node(state: AgentState) -> AgentState:
         return {
             **state,
             "run_id": run_id,
+            "last_execution_node": "executor",
             "intermediate_results": [],
             "final_result": "No valid plan steps were provided.",
         }
@@ -248,6 +249,7 @@ def executor_node(state: AgentState) -> AgentState:
     return {
         **state,
         "run_id": run_id,
+        "last_execution_node": "executor",
         "intermediate_results": step_results,
         "final_result": _build_final_result(step_results),
     }

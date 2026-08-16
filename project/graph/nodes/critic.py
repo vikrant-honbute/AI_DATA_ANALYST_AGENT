@@ -75,6 +75,7 @@ def _build_critic_prompt(
     data_source: str,
     csv_columns: list[str],
     format_instructions: str,
+    execution_mode: str = "executor",
 ) -> str:
     """Build strict JSON prompt for issue detection and plan correction."""
     serialized_plan = json.dumps(plan_steps, default=str, ensure_ascii=True)
@@ -83,6 +84,7 @@ def _build_critic_prompt(
     return render_prompt(
         "critic_prompt.txt",
         data_source=data_source,
+        execution_mode=execution_mode,
         csv_columns=json.dumps(csv_columns, ensure_ascii=True),
         serialized_plan=serialized_plan,
         serialized_results=serialized_results,
@@ -355,6 +357,7 @@ def critic_node(state: AgentState) -> AgentState:
     data_source_value = state.get("data_source", "csv")
     data_source = data_source_value if data_source_value in {"csv", "postgres", "mongo"} else "csv"
     csv_columns = _extract_csv_columns_from_state(state)
+    execution_mode = "dashboard" if state.get("last_execution_node") == "dashboard" else "executor"
 
     parser = PydanticOutputParser(pydantic_object=CriticOutputModel)
     prompt = _build_critic_prompt(
@@ -363,6 +366,7 @@ def critic_node(state: AgentState) -> AgentState:
         data_source,
         csv_columns,
         parser.get_format_instructions(),
+        execution_mode=execution_mode,
     )
 
     parsed: CriticOutputModel

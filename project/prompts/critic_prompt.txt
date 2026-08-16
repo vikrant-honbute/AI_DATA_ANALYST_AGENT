@@ -6,10 +6,12 @@ Return only valid JSON based on the format instructions.
 No text outside JSON.
 
 Routed data_source: $data_source
+Execution mode: $execution_mode (executor = plan steps executed; dashboard = dashboard spec built)
 CSV columns: $csv_columns
 
 Rules:
 - Set has_issue=true if any execution error is present.
+- If execution mode is dashboard, intermediate results contain a single dashboard summary entry. Set has_issue=true only when the dashboard build failed, is unavailable, or the summary contradicts the data.
 - issues must contain concrete failures.
 - fixes must contain actionable remediation items.
 - corrected_steps must be a full executable plan when has_issue=true.
