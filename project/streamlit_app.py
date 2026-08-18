@@ -19,6 +19,8 @@ import streamlit as st
 try:
     from config import get_settings
     from dashboard.charts import build_figure_for_chart
+    from dashboard.context import build_dashboard_context
+    from dashboard.render import render_ai_dashboard
     from dashboard.spec import normalize_spec as normalize_dashboard_spec
     from graph import build_workflow
     from graph.state import AgentState
@@ -26,6 +28,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
     from project.config import get_settings
     from project.dashboard.charts import build_figure_for_chart
+    from project.dashboard.context import build_dashboard_context
+    from project.dashboard.render import render_ai_dashboard
     from project.dashboard.spec import normalize_spec as normalize_dashboard_spec
     from project.graph import build_workflow
     from project.graph.state import AgentState
@@ -1971,6 +1975,45 @@ def _get_compiled_graph():
     return build_workflow()
 
 
+def _run_dashboard_ask(
+    app: Any,
+    ask_query: str,
+    dashboard_config: dict[str, Any],
+    view: dict[str, Any],
+    uploaded_df: pd.DataFrame,
+) -> None:
+    """Run the Data Analyst Agent with the active dashboard context and show the answer."""
+    context = build_dashboard_context(
+        dashboard_config, view.get("active_filters", {}), view.get("runtime")
+    )
+    ask_initial = _build_initial_state(
+        ask_query,
+        uploaded_df,
+        session_id=st.session_state.get("ada_session_id", ""),
+        dashboard=False,
+    )
+    ask_initial["dashboard_context"] = context
+
+    with st.spinner("Analyzing your question in the current dashboard context..."):
+        try:
+            asked_state: AgentState = app.invoke(ask_initial, config={"recursion_limit": 25})
+        except Exception as exc:
+            st.error(f"Ask-AI analysis failed: {exc}")
+            return
+
+    st.markdown('<div class="ada-bi-section">💬 AI Answer</div>', unsafe_allow_html=True)
+    answer = _extract_result(asked_state)
+    if answer:
+        st.markdown(answer)
+    else:
+        st.info("The agent produced no textual answer for this question.")
+
+    ask_insights = _extract_insights(asked_state)
+    if ask_insights:
+        with st.expander("Additional insights"):
+            st.markdown(ask_insights)
+
+
 def main() -> None:
     """Render Streamlit controls and run the analysis workflow."""
     st.set_page_config(page_title="AI Data Analysis Agent", layout="wide")
@@ -2044,10 +2087,20 @@ def main() -> None:
     result = _extract_result(final_state)
     insights = _extract_insights(final_state)
     step_results = _extract_step_results(final_state)
-    dashboard_spec = final_state.get("dashboard_spec")
-    if isinstance(dashboard_spec, dict):
-        dashboard_spec = normalize_dashboard_spec(dashboard_spec) or dashboard_spec
-        _render_dashboard_section(dashboard_spec)
+    app = _get_compiled_graph()
+
+    dashboard_config = final_state.get("dashboard_config")
+    if isinstance(dashboard_config, dict) and dashboard_config.get("kpis") and uploaded_df is not None:
+        view = render_ai_dashboard(dashboard_config, uploaded_df)
+        ask_query = view.get("ask_query", "")
+        if ask_query:
+            _run_dashboard_ask(app, ask_query, dashboard_config, view, uploaded_df)
+    else:
+        dashboard_spec = final_state.get("dashboard_spec")
+        if isinstance(dashboard_spec, dict):
+            dashboard_spec = normalize_dashboard_spec(dashboard_spec) or dashboard_spec
+            _render_dashboard_section(dashboard_spec)
+
     chart_entries = _collect_chart_paths(step_results)
 
     raw_retry_count = final_state.get("retry_count", 0)

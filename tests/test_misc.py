@@ -22,6 +22,7 @@ class TestPromptRendering:
             memory_context_text="none",
             use_memory_context="false",
             format_instructions="{}",
+            dashboard_context="None",
         )
         assert "sum sales" in text
 
@@ -33,8 +34,11 @@ class TestPromptRendering:
             serialized_plan="[]",
             serialized_results="[]",
             format_instructions="{}",
+            execution_mode="executor",
+            dashboard_context="None",
         )
         assert "csv" in text
+        assert "Dashboard context" in text
 
     def test_router_prompt_renders(self):
         text = render_prompt(
@@ -43,7 +47,9 @@ class TestPromptRendering:
         assert "sum sales" in text
 
     def test_insight_prompt_renders(self):
-        text = render_prompt("insight_prompt.txt", final_result="result")
+        text = render_prompt(
+            "insight_prompt.txt", final_result="result", dashboard_context="None"
+        )
         assert "result" in text
 
     def test_missing_variable_fails_fast(self):

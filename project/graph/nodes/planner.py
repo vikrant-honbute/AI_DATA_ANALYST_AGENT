@@ -79,6 +79,31 @@ def _is_dashboard_request(query: str) -> bool:
     return any(keyword in lowered for keyword in _DASHBOARD_KEYWORDS)
 
 
+def _dashboard_context_text(state: AgentState) -> str:
+    """Serialize the active dashboard context (filters / view) for the LLM."""
+    context = state.get("dashboard_context")
+    if not isinstance(context, dict) or not context:
+        return "None"
+    bits: list[str] = []
+    active = context.get("active_filters_text")
+    if isinstance(active, str) and active.strip() and active.strip() != "None":
+        bits.append(f"Active filters: {active.strip()}")
+    title = context.get("title")
+    if isinstance(title, str) and title.strip():
+        bits.append(f"Dashboard: {title.strip()}")
+    row_count = context.get("row_count")
+    if isinstance(row_count, int):
+        bits.append(f"Rows in current view: {row_count:,}")
+    kpis = context.get("kpis")
+    if isinstance(kpis, list) and kpis:
+        kpi_text = ", ".join(
+            f"{k.get('label')}={k.get('value')}" for k in kpis[:5] if k.get("value")
+        )
+        if kpi_text:
+            bits.append(f"Current KPIs: {kpi_text}")
+    return " | ".join(bits) if bits else "None"
+
+
 def _build_router_prompt(query: str, has_uploaded_csv: bool) -> str:
     """Build a strict one-word data source routing prompt."""
     return render_prompt(
@@ -96,6 +121,7 @@ def _build_planner_prompt(
     memory_context_text: str,
     use_memory_context: bool,
     format_instructions: str,
+    dashboard_context_text: str = "None",
 ) -> str:
     """Build a strict JSON planning prompt for the LLM."""
     return render_prompt(
@@ -107,6 +133,7 @@ def _build_planner_prompt(
         memory_context_text=memory_context_text,
         use_memory_context=str(use_memory_context).lower(),
         format_instructions=format_instructions,
+        dashboard_context=dashboard_context_text,
     )
 
 
@@ -123,6 +150,55 @@ def _extract_text(content: Any) -> str:
         return "\n".join(parts)
 
     return str(content)
+
+
+def _safe_json_text(raw: str) -> str:
+    """Strip markdown fences/extra prose so a JSON payload can be parsed."""
+    text = raw.strip()
+    if text.startswith("```"):
+        # Remove surrounding code fences (```json ... ```).
+        lines = text.splitlines()
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    if not text or text[0] not in "{[":
+        # Fall back to the last balanced {...} or [...] block.
+        for opener, closer in (("{", "}"), ("[", "]")):
+            start = text.find(opener)
+            end = text.rfind(closer)
+            if start != -1 and end > start:
+                candidate = text[start : end + 1]
+                if _is_balanced(candidate, opener, closer):
+                    text = candidate
+                    break
+    return text
+
+
+def _is_balanced(text: str, opener: str, closer: str) -> bool:
+    """Return True when braces/brackets in text are balanced."""
+    depth = 0
+    in_string = False
+    escape = False
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
 
 
 def _is_explicit_database_request(query: str) -> bool:
@@ -609,6 +685,7 @@ def planner_node(state: AgentState) -> AgentState:
         _build_memory_context_text(selected_memory),
         bool(selected_memory),
         parser.get_format_instructions(),
+        _dashboard_context_text(state),
     )
 
     parsed: PlannerOutputModel
@@ -617,7 +694,7 @@ def planner_node(state: AgentState) -> AgentState:
         llm = get_llm()
         response = llm.invoke(prompt)
         raw_text = _extract_text(response.content)
-        parsed = parser.parse(raw_text)
+        parsed = parser.parse(_safe_json_text(raw_text))
     except Exception:
         parsed = _fallback_output(query, routed_data_source, csv_columns)
 

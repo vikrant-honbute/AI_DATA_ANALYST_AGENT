@@ -90,6 +90,7 @@ def _extract_text(content: Any) -> str:
     """Normalize LangChain response content into plain text."""
     if isinstance(content, str):
         return content
+
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
@@ -97,6 +98,53 @@ def _extract_text(content: Any) -> str:
                 parts.append(item["text"])
         return "\n".join(parts)
     return str(content)
+
+
+def _safe_json_text(raw: str) -> str:
+    """Strip markdown fences/extra prose so a JSON payload can be parsed."""
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    if not text or text[0] not in "{[":
+        for opener, closer in (("{", "}"), ("[", "]")):
+            start = text.find(opener)
+            end = text.rfind(closer)
+            if start != -1 and end > start:
+                candidate = text[start : end + 1]
+                if _is_balanced(candidate, opener, closer):
+                    text = candidate
+                    break
+    return text
+
+
+def _is_balanced(text: str, opener: str, closer: str) -> bool:
+    """Return True when braces/brackets in text are balanced."""
+    depth = 0
+    in_string = False
+    escape = False
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
 
 
 def build_dashboard_config(
@@ -128,7 +176,7 @@ def build_dashboard_config(
         )
         llm = get_llm()
         response = llm.invoke(prompt)
-        parsed = parser.parse(_extract_text(response.content))
+        parsed = parser.parse(_safe_json_text(_extract_text(response.content)))
         config = parsed.as_dict()
     except Exception as exc:
         logger.warning("dashboard[planner] LLM planning failed; using fallback config: %s", exc)

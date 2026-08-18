@@ -8,12 +8,14 @@ from typing import Any
 try:
     from graph.state import AgentState
     from graph.nodes.critic import MAX_RETRIES
+    from graph.nodes.planner import _dashboard_context_text
     from llm import get_llm
     from prompts import render_prompt
     from tools.memory_tool import save_memory
 except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
     from project.graph.state import AgentState
     from project.graph.nodes.critic import MAX_RETRIES
+    from project.graph.nodes.planner import _dashboard_context_text
     from project.llm import get_llm
     from project.prompts import render_prompt
     from project.tools.memory_tool import save_memory
@@ -23,9 +25,13 @@ _MEMORY_RESULT_CHAR_LIMIT = 1200
 logger = logging.getLogger(__name__)
 
 
-def _build_insight_prompt(final_result: str) -> str:
+def _build_insight_prompt(final_result: str, dashboard_context: str = "None") -> str:
     """Build a prompt that asks for concise analytical insights."""
-    return render_prompt("insight_prompt.txt", final_result=final_result)
+    return render_prompt(
+        "insight_prompt.txt",
+        final_result=final_result,
+        dashboard_context=dashboard_context,
+    )
 
 
 def _extract_text(content: Any) -> str:
@@ -79,7 +85,7 @@ def insight_node(state: AgentState) -> AgentState:
 
     try:
         llm = get_llm()
-        response = llm.invoke(_build_insight_prompt(final_result))
+        response = llm.invoke(_build_insight_prompt(final_result, _dashboard_context_text(state)))
         insights = _extract_text(response.content).strip()
     except Exception as exc:
         insights = f"Insight generation error: {exc}"

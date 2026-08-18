@@ -21,3 +21,6 @@ Business Meaning:
 
 Final result:
 $final_result
+
+Dashboard context (active filters/view for dashboard follow-up questions; "None" otherwise):
+$dashboard_context

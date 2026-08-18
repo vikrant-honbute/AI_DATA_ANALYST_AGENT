@@ -31,7 +31,14 @@ def _to_number(value: Any) -> float | None:
 
 
 def _aggregate_series(series: pd.Series, aggregation: str) -> float | None:
-    """Apply one aggregation to a numeric series; returns None on empty input."""
+    """Apply one aggregation to a series; returns None on empty input."""
+    if aggregation == "nunique":
+        cleaned = series.dropna()
+        return _to_number(float(cleaned.nunique())) if not cleaned.empty else None
+    if aggregation == "count":
+        cleaned = series.dropna()
+        return _to_number(float(len(cleaned))) if not cleaned.empty else None
+
     numeric = pd.to_numeric(series, errors="coerce").dropna()
     if numeric.empty:
         return None
@@ -45,10 +52,6 @@ def _aggregate_series(series: pd.Series, aggregation: str) -> float | None:
         result = numeric.min()
     elif aggregation == "max":
         result = numeric.max()
-    elif aggregation == "nunique":
-        result = float(series.nunique(dropna=True))
-    elif aggregation == "count":
-        result = float(numeric.count())
     else:
         return None
     return _to_number(result)

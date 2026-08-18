@@ -243,7 +243,16 @@ def validate_chart(chart: dict[str, Any], df: pd.DataFrame) -> list[ConfigIssue]
 
     # Chart type / data-shape compatibility (deterministic chart selector rules).
     if chart_type in {"donut", "pie"} and dimension is not None and dimension in columns:
-        if df[dimension].nunique() > MAX_DONUT_CATEGORIES:
+        if pd.api.types.is_datetime64_any_dtype(df[dimension]):
+            issues.append(
+                ConfigIssue(
+                    "chart_type",
+                    f"'{dimension}' is a time column; a {chart_type} is not meaningful. Using 'bar'.",
+                    repaired=True,
+                )
+            )
+            chart["chart_type"] = "bar"
+        elif df[dimension].nunique() > MAX_DONUT_CATEGORIES:
             issues.append(
                 ConfigIssue(
                     "chart_type",

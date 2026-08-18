@@ -12,10 +12,12 @@ try:
     from graph.state import AgentState
     from llm import get_llm
     from prompts import render_prompt
+    from graph.nodes.planner import _dashboard_context_text
 except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
     from project.graph.state import AgentState
     from project.llm import get_llm
     from project.prompts import render_prompt
+    from project.graph.nodes.planner import _dashboard_context_text
 
 
 MAX_RETRIES = 2
@@ -76,6 +78,7 @@ def _build_critic_prompt(
     csv_columns: list[str],
     format_instructions: str,
     execution_mode: str = "executor",
+    dashboard_context_text: str = "None",
 ) -> str:
     """Build strict JSON prompt for issue detection and plan correction."""
     serialized_plan = json.dumps(plan_steps, default=str, ensure_ascii=True)
@@ -89,6 +92,7 @@ def _build_critic_prompt(
         serialized_plan=serialized_plan,
         serialized_results=serialized_results,
         format_instructions=format_instructions,
+        dashboard_context=dashboard_context_text,
     )
 
 
@@ -367,6 +371,7 @@ def critic_node(state: AgentState) -> AgentState:
         csv_columns,
         parser.get_format_instructions(),
         execution_mode=execution_mode,
+        dashboard_context_text=_dashboard_context_text(state),
     )
 
     parsed: CriticOutputModel

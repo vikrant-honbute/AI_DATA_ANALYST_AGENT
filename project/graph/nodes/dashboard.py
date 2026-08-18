@@ -73,7 +73,7 @@ def _render_config_summary(config: dict[str, Any], runtime: dict[str, Any]) -> s
     ]
     for kpi in runtime.get("kpis", []):
         delta = kpi.get("delta")
-        suffix = f" ({delta})" if delta else ""
+        suffix = f" ({delta})" if delta and str(delta).strip() not in {"False", ""} else ""
         lines.append(f"- {kpi.get('label')}: {kpi.get('value')}{suffix}")
 
     charts = runtime.get("charts", [])

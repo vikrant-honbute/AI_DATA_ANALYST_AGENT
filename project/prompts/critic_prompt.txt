@@ -8,6 +8,7 @@ No text outside JSON.
 Routed data_source: $data_source
 Execution mode: $execution_mode (executor = plan steps executed; dashboard = dashboard spec built)
 CSV columns: $csv_columns
+Dashboard context (active filters/view for dashboard follow-up questions; "None" otherwise): $dashboard_context
 
 Rules:
 - Set has_issue=true if any execution error is present.
