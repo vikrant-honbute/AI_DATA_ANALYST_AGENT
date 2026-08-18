@@ -1,15 +1,16 @@
-"""Dashboard node: builds a professional dashboard spec from the routed data.
+"""Dashboard node: builds an AI-planned dashboard configuration.
 
-Runs instead of the executor when the planner flags dashboard intent. It
+This node runs instead of the executor when the planner flags dashboard intent. It
 acquires a DataFrame (uploaded CSV or a capped PostgreSQL sample), profiles it,
-builds a deterministic spec, optionally refines the narrative with the LLM,
-and writes a JSON-safe dashboard_spec plus a readable final_result.
+asks the AI dashboard planner for a validated configuration, then computes a
+default runtime rendering so the CLI, critic and memory still receive a readable
+``final_result``. The interactive Streamlit dashboard re-renders from the same
+configuration + the engine when filters change (no LLM call).
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,17 +18,12 @@ import pandas as pd
 
 try:
     from config import get_settings
-    from dashboard import build_dashboard_spec, normalize_spec, profile_dataframe, refine_spec_with_llm
+    from dashboard import build_dashboard_config, compute_dashboard, profile_dataframe
     from graph.state import AgentState
     from tools.sql_tool import fetch_postgres_schema, query_postgres
 except ModuleNotFoundError:  # pragma: no cover - supports package-style execution.
     from project.config import get_settings
-    from project.dashboard import (
-        build_dashboard_spec,
-        normalize_spec,
-        profile_dataframe,
-        refine_spec_with_llm,
-    )
+    from project.dashboard import build_dashboard_config, compute_dashboard, profile_dataframe
     from project.graph.state import AgentState
     from project.tools.sql_tool import fetch_postgres_schema, query_postgres
 
@@ -67,21 +63,20 @@ def _acquire_dataframe(state: AgentState) -> tuple[pd.DataFrame | None, str]:
         return None, "postgres"
     return dataframe, "postgres"
 
-
-def _render_spec_summary(spec: dict[str, Any]) -> str:
-    """Render a readable text summary of the spec for CLI, critic, and memory."""
+def _render_config_summary(config: dict[str, Any], runtime: dict[str, Any]) -> str:
+    """Render a readable text summary of the config + runtime for CLI/critic."""
     lines = [
-        f"Dashboard: {spec.get('title', 'Executive Dashboard')}",
-        f"Scope: {spec.get('subtitle', '')}".strip(),
+        f"Dashboard: {config.get('title', 'Executive Dashboard')}",
+        f"Scope: {config.get('subtitle', '')}".strip(),
         "",
         "KPIs:",
     ]
-    for kpi in spec.get("kpis", []):
+    for kpi in runtime.get("kpis", []):
         delta = kpi.get("delta")
         suffix = f" ({delta})" if delta else ""
         lines.append(f"- {kpi.get('label')}: {kpi.get('value')}{suffix}")
 
-    charts = spec.get("charts", [])
+    charts = runtime.get("charts", [])
     if charts:
         lines.append("")
         lines.append("Charts:")
@@ -91,31 +86,25 @@ def _render_spec_summary(spec: dict[str, Any]) -> str:
                 f"{index}. {chart.get('title')} ({chart.get('chart_type')}, {rows} data points)"
             )
 
-    summary = str(spec.get("executive_summary", "")).strip()
-    if summary:
-        lines.extend(["", f"Executive summary: {summary}"])
-
-    insights = spec.get("insights", [])
-    if insights:
-        lines.extend(["", "Key facts:"])
-        lines.extend(f"- {item}" for item in insights)
-
+    filters = config.get("filters", [])
+    if filters:
+        lines.append("")
+        lines.append("Filters:")
+        for filt in filters:
+            lines.append(f"- {filt.get('label')} ({filt.get('type')})")
     return "\n".join(lines)
 
 
 def dashboard_node(state: AgentState) -> AgentState:
-    """Build the executive dashboard and return updated state."""
+    """Build the AI-planned dashboard configuration and default rendering."""
     query = str(state.get("query", "")).strip()
-    run_id = str(state.get("run_id") or "").strip() or re.sub(
-        r"[^a-f0-9]", "", str(state.get("session_id") or "")
-    ).lower()
     retry_count = state.get("retry_count", 0)
     retry_count = retry_count if isinstance(retry_count, int) else 0
 
     base_result: dict[str, Any] = {
         **state,
         "last_execution_node": "dashboard",
-        "run_id": run_id,
+        "dashboard": True,
     }
 
     dataframe, source_label = _acquire_dataframe(state)
@@ -127,12 +116,12 @@ def dashboard_node(state: AgentState) -> AgentState:
         )
         return {
             **base_result,
-            "dashboard": True,
+            "dashboard_config": None,
             "dashboard_spec": None,
             "final_result": f"Dashboard could not be built: {reason}",
             "intermediate_results": [
                 {
-                    "step": "Build executive dashboard",
+                    "step": "Plan dashboard configuration",
                     "tool": "visualization",
                     "action": "dashboard",
                     "result": {"type": "dashboard", "status": "unavailable", "reason": reason},
@@ -141,57 +130,37 @@ def dashboard_node(state: AgentState) -> AgentState:
         }
 
     profile = profile_dataframe(dataframe)
-    spec = build_dashboard_spec(dataframe, profile, query=query, focus_offset=retry_count)
-    spec = refine_spec_with_llm(
-        spec, profile.to_dict(), query, feedback=str(state.get("insights", ""))
+    config = build_dashboard_config(
+        dataframe, profile, query=query, feedback=str(state.get("insights", ""))
     )
-    spec["data_source"] = source_label
-    spec["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    spec = normalize_spec(spec)
-    if spec is None:
-        spec = {
-            "title": "Executive Dashboard",
-            "subtitle": "",
-            "data_source": source_label,
-            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "row_count": int(len(dataframe)),
-            "column_count": int(len(dataframe.columns)),
-            "time_range": None,
-            "kpis": [],
-            "charts": [],
-            "executive_summary": "The dashboard could not be assembled from this data shape.",
-            "insights": [],
-            "recommendations": [],
-        }
+    config["data_source"] = source_label
+    config["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    final_result = _render_spec_summary(spec)
-    chart_types = [chart.get("chart_type", "unknown") for chart in spec.get("charts", [])]
+    runtime = compute_dashboard(config, dataframe)
+    final_result = _render_config_summary(config, runtime)
 
     return {
         **base_result,
-        "dashboard": True,
-        "dashboard_spec": spec,
+        "dashboard_config": config,
+        "dashboard_spec": runtime,
         "final_result": final_result,
         "plan": [
-            {
-                "step": "Build executive dashboard",
-                "tool": "visualization",
-                "action": "dashboard",
-            }
+            {"step": "Plan dashboard configuration", "tool": "visualization", "action": "dashboard"}
         ],
         "intermediate_results": [
             {
-                "step": "Build executive dashboard",
+                "step": "Plan dashboard configuration",
                 "tool": "visualization",
                 "action": "dashboard",
                 "result": {
                     "type": "dashboard",
                     "status": "built",
-                    "title": spec.get("title", ""),
-                    "kpi_count": len(spec.get("kpis", [])),
-                    "chart_count": len(spec.get("charts", [])),
-                    "chart_types": chart_types,
+                    "title": config.get("title", ""),
+                    "kpi_count": len(config.get("kpis", [])),
+                    "chart_count": len(config.get("charts", [])),
+                    "filters": [f.get("id") for f in config.get("filters", [])],
                 },
             }
         ],
     }
+

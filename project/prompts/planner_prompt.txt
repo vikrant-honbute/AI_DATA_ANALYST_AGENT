@@ -19,6 +19,10 @@ $memory_context_text
 Memory reuse flag:
 - use_memory_context = $use_memory_context
 
+Dashboard context (active filters/view the user is looking at when they ask a
+follow-up question; set to "None" when not analyzing a dashboard view):
+- dashboard_context = $dashboard_context
+
 Rules:
 - Return valid JSON only.
 - Do not include any text before or after the JSON object.

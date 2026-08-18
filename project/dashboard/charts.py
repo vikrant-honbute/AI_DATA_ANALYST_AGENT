@@ -133,7 +133,7 @@ def _figure_line(df: pd.DataFrame, chart: dict[str, Any]) -> go.Figure | None:
                             size=11, symbol="diamond", color=color,
                             line=dict(color=PLOTLY_TEXT, width=1),
                         ),
-                        hovertemplate=f"{label}: %{y:,.2f}<extra></extra>",
+                        hovertemplate=f"{label}: %{{y:,.2f}}<extra></extra>",
                     )
                 )
         if len(y_values) <= 24:
@@ -300,6 +300,151 @@ def _figure_heatmap(df: pd.DataFrame, chart: dict[str, Any]) -> go.Figure | None
     return figure
 
 
+def _figure_hbar(df: pd.DataFrame, chart: dict[str, Any]) -> go.Figure | None:
+    """Horizontal bar chart for high-cardinality top-N breakdowns."""
+    x_key, y_key = chart.get("x") or "x", chart.get("y") or "value"
+    if x_key not in df.columns or y_key not in df.columns:
+        return None
+    frame = df[[x_key, y_key]].copy()
+    frame[y_key] = pd.to_numeric(frame[y_key], errors="coerce")
+    frame = frame.dropna().sort_values(y_key, ascending=True)
+    if frame.empty:
+        return None
+
+    labels = [str(value) for value in frame[x_key].tolist()]
+    values = [float(value) for value in frame[y_key].tolist()]
+    metric_label = prettify_name(y_key)
+    money = looks_like_money(metric_label)
+
+    figure = go.Figure(
+        go.Bar(
+            x=values,
+            y=labels,
+            orientation="h",
+            marker_color=highlight_colors(values),
+            text=[format_value(value, money) for value in values],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="%{y}<br>%{x:,.2f}<extra></extra>",
+        )
+    )
+    figure.update_layout(**base_layout(x_title=metric_label, y_title=prettify_name(x_key)))
+    return figure
+
+
+def _figure_area(df: pd.DataFrame, chart: dict[str, Any]) -> go.Figure | None:
+    """Filled area chart reusing the line logic with an area fill."""
+    figure = _figure_line(df, chart)
+    if figure is None:
+        return None
+    for trace in figure.data:
+        trace.fill = "tozeroy"
+        trace.fillcolor = "rgba(59, 130, 246, 0.12)"
+    figure.update_layout(height=PLOTLY_CHART_HEIGHT)
+    return figure
+
+
+def _figure_pie(df: pd.DataFrame, chart: dict[str, Any]) -> go.Figure | None:
+    """Pie chart (solid, no hole) for categorical share."""
+    x_key, y_key = chart.get("x") or "x", chart.get("y") or "value"
+    if x_key not in df.columns or y_key not in df.columns:
+        return None
+    frame = df[[x_key, y_key]].copy()
+    frame[y_key] = pd.to_numeric(frame[y_key], errors="coerce")
+    frame = frame.dropna().sort_values(y_key, ascending=False)
+    if frame.empty:
+        return None
+
+    figure = _figure_donut(df, chart)
+    if figure is None:
+        return None
+    for trace in figure.data:
+        if isinstance(trace, go.Pie):
+            trace.hole = 0.0
+    return figure
+
+
+def _figure_scatter(df: pd.DataFrame, chart: dict[str, Any]) -> go.Figure | None:
+    """Scatter plot for numeric-to-numeric relationships."""
+    x_key, y_key = chart.get("x") or "x", chart.get("y") or "y"
+    if x_key not in df.columns or y_key not in df.columns:
+        return None
+    frame = df[[x_key, y_key]].copy()
+    frame[x_key] = pd.to_numeric(frame[x_key], errors="coerce")
+    frame[y_key] = pd.to_numeric(frame[y_key], errors="coerce")
+    frame = frame.dropna()
+    if frame.empty:
+        return None
+
+    x_values = [float(value) for value in frame[x_key].tolist()]
+    y_values = [float(value) for value in frame[y_key].tolist()]
+    colors = highlight_colors(y_values)
+
+    figure = go.Figure(
+        go.Scatter(
+            x=x_values,
+            y=y_values,
+            mode="markers",
+            marker=dict(
+                size=9,
+                color=colors,
+                opacity=0.85,
+                line=dict(color=PLOTLY_CARD_BG, width=0.5),
+            ),
+            hovertemplate="%{x:,.2f}<br>%{y:,.2f}<extra></extra>",
+        )
+    )
+    figure.update_layout(**base_layout(x_title=prettify_name(x_key), y_title=prettify_name(y_key)))
+    return figure
+
+
+def _figure_grouped_bar(df: pd.DataFrame, chart: dict[str, Any]) -> go.Figure | None:
+    """Grouped bar chart for dimension x split_by comparisons."""
+    x_key, y_key = chart.get("x") or "x", chart.get("y") or "value"
+    if x_key not in df.columns or y_key not in df.columns or "series" not in df.columns:
+        return _figure_bar(df, chart)
+    frame = df[[x_key, y_key, "series"]].copy()
+    frame[y_key] = pd.to_numeric(frame[y_key], errors="coerce")
+    frame = frame.dropna(subset=[y_key])
+    if frame.empty:
+        return None
+
+    series_names = list(dict.fromkeys(str(v) for v in frame["series"].tolist()))
+    metric_label = prettify_name(y_key)
+    money = looks_like_money(metric_label)
+    figure = go.Figure()
+    palette = (PLOTLY_BLUE, PLOTLY_BLUE_LIGHT, PLOTLY_GREEN, PLOTLY_RED, PLOTLY_BLUE_PALE)
+    for index, series_name in enumerate(series_names[:6]):
+        subset = frame[frame["series"].astype(str) == str(series_name)]
+        labels = [str(v) for v in subset[x_key].tolist()]
+        values = [float(v) for v in subset[y_key].tolist()]
+        figure.add_trace(
+            go.Bar(
+                name=str(series_name),
+                x=labels,
+                y=values,
+                marker_color=palette[index % len(palette)],
+                text=[format_value(value, money) for value in values],
+                textposition="outside",
+                cliponaxis=False,
+                hovertemplate=f"{series_name}<br>" + "%{x}<br>%{y:,.2f}<extra></extra>",
+            )
+        )
+    figure.update_layout(
+        **base_layout(x_title=prettify_name(x_key), y_title=metric_label),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            font=dict(color=PLOTLY_MUTED, size=11),
+        ),
+        barmode="group",
+    )
+    return figure
+
 def build_figure_for_chart(chart: dict[str, Any]) -> go.Figure | None:
     """Build a Plotly figure from one dashboard chart spec entry."""
     if not isinstance(chart, dict):
@@ -311,8 +456,12 @@ def build_figure_for_chart(chart: dict[str, Any]) -> go.Figure | None:
 
     builders = {
         "line": _figure_line,
-        "bar": _figure_bar,
+        "bar": _figure_grouped_bar,
+        "hbar": _figure_hbar,
+        "area": _figure_area,
         "donut": _figure_donut,
+        "pie": _figure_pie,
+        "scatter": _figure_scatter,
         "hist": _figure_hist,
         "heatmap": _figure_heatmap,
     }
